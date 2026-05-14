@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HelpDesk — Ticketing System</title>
+    <link rel="stylesheet" href="/css/style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎫</text></svg>">
+</head>
+<body>
+
+<!-- ══════════════════════════════════════
+     LOGIN PAGE
+══════════════════════════════════════ -->
+<div id="login-page" class="login-page hidden">
+    <div class="login-card">
+        <div class="login-logo">
+            <div class="logo-icon">H</div>
+            <div>
+                <h1>HelpDesk</h1>
+                <p>Ticketing System</p>
+            </div>
+        </div>
+
+        <div id="login-error" class="alert alert-error hidden"></div>
+
+        <form onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label class="form-label">Username or Email</label>
+                <input type="text" class="form-input" id="login-username" placeholder="Enter your username..." autocomplete="username" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Password</label>
+                <input type="password" class="form-input" id="login-password" placeholder="••••••••" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn btn-primary btn-lg" id="login-btn" style="width:100%;margin-top:8px;">Sign In</button>
+        </form>
+
+        <div style="margin-top:24px;padding-top:16px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;">
+            <button class="btn-icon" onclick="toggleTheme()" id="theme-toggle" data-tip="Toggle dark mode" style="border:none;">🌙</button>
+        </div>
+    </div>
+</div>
+
+<!-- ══════════════════════════════════════
+     APP LAYOUT
+══════════════════════════════════════ -->
+<div id="app-layout" class="app-layout hidden">
+
+    <!-- SIDEBAR -->
+    <aside class="sidebar">
+        <div class="sidebar-logo">
+            <div class="logo-icon">H</div>
+            <span>HelpDesk</span>
+        </div>
+
+        <nav class="sidebar-nav" id="sidebar-nav">
+            <!-- Populated by JS -->
+        </nav>
+
+        <div class="sidebar-footer">
+            <div class="user-info" onclick="toggleUserMenu()">
+                <div class="user-avatar" id="user-avatar">—</div>
+                <div class="user-info-text">
+                    <div class="user-name" id="user-name">Loading...</div>
+                    <div class="user-role" id="user-role"></div>
+                </div>
+            </div>
+            <div id="user-menu" class="hidden" style="margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;">
+                <button onclick="openChangePassword()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--text-primary);cursor:pointer;font-family:inherit;">🔑 Change Password</button>
+                <button onclick="toggleTheme()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--text-primary);cursor:pointer;font-family:inherit;" id="theme-toggle-sidebar">🌙 Dark Mode</button>
+                <hr style="margin:0;border-color:var(--border);">
+                <button onclick="handleLogout()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--danger);cursor:pointer;font-family:inherit;">🚪 Sign Out</button>
+            </div>
+        </div>
+    </aside>
+
+    <!-- MAIN CONTENT -->
+    <div class="main-content">
+        <!-- TOPBAR -->
+        <header class="topbar">
+            <div>
+                <span class="topbar-title" id="page-title">Dashboard</span>
+            </div>
+            <div class="topbar-actions">
+                <button class="btn-icon" onclick="toggleTheme()" id="theme-toggle" data-tip="Toggle theme">🌙</button>
+                <button class="btn btn-primary btn-sm" onclick="navigateTo('create-ticket')">➕ New Ticket</button>
+            </div>
+        </header>
+
+        <!-- PAGE CONTENT -->
+        <main class="page-content" id="page-content">
+            <div class="empty-state">
+                <div class="empty-icon">⏳</div>
+                <p>Loading...</p>
+            </div>
+        </main>
+    </div>
+</div>
+
+<!-- ══════════════════════════════════════
+     SCRIPTS
+══════════════════════════════════════ -->
+<script src="/js/app.js"></script>
+<script>
+// Extra UI helpers not in app.js
+function toggleUserMenu() {
+    const menu = document.getElementById('user-menu');
+    menu.classList.toggle('hidden');
+}
+
+document.addEventListener('click', (e) => {
+    const menu = document.getElementById('user-menu');
+    if (menu && !menu.classList.contains('hidden')) {
+        if (!e.target.closest('.sidebar-footer')) {
+            menu.classList.add('hidden');
+        }
+    }
+});
+
+function openChangePassword() {
+    document.getElementById('user-menu').classList.add('hidden');
+    const html = `
+        <div class="modal-overlay active" id="changepw-modal">
+            <div class="modal">
+                <div class="modal-header">
+                    <span class="modal-title">🔑 Change Password</span>
+                    <button class="modal-close" onclick="closeModal('changepw-modal')">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div id="pw-alert"></div>
+                    <div class="form-group">
+                        <label class="form-label">Current Password</label>
+                        <input type="password" class="form-input" id="pw-current" placeholder="Your current password">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">New Password</label>
+                        <input type="password" class="form-input" id="pw-new" placeholder="Min. 8 characters">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Confirm New Password</label>
+                        <input type="password" class="form-input" id="pw-confirm" placeholder="Repeat new password">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="closeModal('changepw-modal')">Cancel</button>
+                    <button class="btn btn-primary" onclick="submitChangePassword()">Change Password</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', html);
+}
+
+async function submitChangePassword() {
+    const current = document.getElementById('pw-current').value;
+    const newPw = document.getElementById('pw-new').value;
+    const confirm = document.getElementById('pw-confirm').value;
+    const alertEl = document.getElementById('pw-alert');
+
+    if (newPw !== confirm) {
+        alertEl.innerHTML = `<div class="alert alert-error">❌ Passwords do not match.</div>`;
+        return;
+    }
+    if (newPw.length < 8) {
+        alertEl.innerHTML = `<div class="alert alert-error">❌ Password must be at least 8 characters.</div>`;
+        return;
+    }
+
+    const data = await API.post('/auth/change-password', { current_password: current, new_password: newPw });
+    if (data.success) {
+        closeModal('changepw-modal');
+        showToast('Password changed successfully!', 'success');
+    } else {
+        alertEl.innerHTML = `<div class="alert alert-error">❌ ${data.message}</div>`;
+    }
+}
+</script>
+</body>
+</html>
