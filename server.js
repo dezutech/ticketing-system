@@ -8,6 +8,7 @@ const path = require('path');
 const authRoutes = require('./backend/routes/auth');
 const ticketRoutes = require('./backend/routes/tickets');
 const userRoutes = require('./backend/routes/users');
+const assetRoutes = require('./backend/routes/assets');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -28,6 +29,7 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 app.use('/api/auth', authRoutes);
 app.use('/api/tickets', ticketRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/assets', assetRoutes);
 
 // SPA fallback — serve index.html for all non-API routes
 app.get('*', (req, res) => {

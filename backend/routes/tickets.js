@@ -39,6 +39,89 @@ async function generateTicketNumber() {
     return `TKT-${year}-${String(count).padStart(4, '0')}`;
 }
 
+function canManageAssets(user) {
+    return ['Super Admin', 'Admin', 'Staff'].includes(user?.role_name);
+}
+
+async function linkTicketAsset(ticketId, assetId, user) {
+    if (assetId && !Number.isInteger(Number(assetId))) {
+        throw new Error('Invalid asset selected.');
+    }
+
+    const existing = await query(`
+        SELECT ta.asset_id, a.asset_tag, a.asset_name, a.assigned_to
+        FROM ticket_assets ta
+        LEFT JOIN assets a ON ta.asset_id = a.asset_id
+        WHERE ta.ticket_id = @ticketId
+    `, {
+        ticketId: { type: sql.Int, value: ticketId }
+    });
+
+    const oldAsset = existing.recordset[0] || null;
+
+    if (!assetId) {
+        if (oldAsset) {
+            if (!canManageAssets(user) && oldAsset.assigned_to !== user.user_id) {
+                throw new Error('You can only update tickets for assets assigned to your account.');
+            }
+            await query(`DELETE FROM ticket_assets WHERE ticket_id = @ticketId`, {
+                ticketId: { type: sql.Int, value: ticketId }
+            });
+            await query(`
+                INSERT INTO TicketHistory (ticket_id, changed_by, field_changed, old_value, new_value)
+                VALUES (@ticketId, @userId, 'asset', @oldValue, NULL)
+            `, {
+                ticketId: { type: sql.Int, value: ticketId },
+                userId: { type: sql.Int, value: user.user_id },
+                oldValue: { type: sql.NVarChar, value: `${oldAsset.asset_tag} - ${oldAsset.asset_name}` }
+            });
+        }
+        return;
+    }
+
+    const asset = await query(`SELECT asset_id, asset_tag, asset_name, assigned_to FROM assets WHERE asset_id = @assetId`, {
+        assetId: { type: sql.Int, value: assetId }
+    });
+    if (!asset.recordset.length) throw new Error('Selected asset not found.');
+
+    const newAsset = asset.recordset[0];
+    if (!canManageAssets(user) && newAsset.assigned_to !== user.user_id) {
+        throw new Error('You can only create tickets for assets assigned to your account.');
+    }
+
+    if (oldAsset && oldAsset.asset_id === parseInt(assetId)) return;
+
+    if (oldAsset) {
+        await query(`
+            UPDATE ticket_assets SET asset_id = @assetId, linked_by = @userId, linked_at = GETDATE()
+            WHERE ticket_id = @ticketId
+        `, {
+            ticketId: { type: sql.Int, value: ticketId },
+            assetId: { type: sql.Int, value: assetId },
+            userId: { type: sql.Int, value: user.user_id }
+        });
+    } else {
+        await query(`
+            INSERT INTO ticket_assets (ticket_id, asset_id, linked_by)
+            VALUES (@ticketId, @assetId, @userId)
+        `, {
+            ticketId: { type: sql.Int, value: ticketId },
+            assetId: { type: sql.Int, value: assetId },
+            userId: { type: sql.Int, value: user.user_id }
+        });
+    }
+
+    await query(`
+        INSERT INTO TicketHistory (ticket_id, changed_by, field_changed, old_value, new_value)
+        VALUES (@ticketId, @userId, 'asset', @oldValue, @newValue)
+    `, {
+        ticketId: { type: sql.Int, value: ticketId },
+        userId: { type: sql.Int, value: user.user_id },
+        oldValue: { type: sql.NVarChar, value: oldAsset ? `${oldAsset.asset_tag} - ${oldAsset.asset_name}` : null },
+        newValue: { type: sql.NVarChar, value: `${newAsset.asset_tag} - ${newAsset.asset_name}` }
+    });
+}
+
 // GET /api/tickets — list tickets
 router.get('/', authenticateToken, async (req, res) => {
     try {
@@ -125,6 +208,19 @@ router.get('/stats', authenticateToken, async (req, res) => {
     }
 });
 
+// GET /api/tickets/attachment/:id/download
+router.get('/attachment/:id/download', authenticateToken, async (req, res) => {
+    try {
+        const result = await query(`SELECT * FROM TicketAttachments WHERE attachment_id = @id`, { id: { type: sql.Int, value: req.params.id } });
+        if (!result.recordset.length) return res.status(404).json({ success: false, message: 'File not found.' });
+        const file = result.recordset[0];
+        res.download(file.file_path, file.original_name);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
 // GET /api/tickets/:id
 router.get('/:id', authenticateToken, async (req, res) => {
     try {
@@ -161,7 +257,25 @@ router.get('/:id', authenticateToken, async (req, res) => {
             WHERE th.ticket_id = @id ORDER BY th.changed_at DESC
         `, { id: { type: sql.Int, value: req.params.id } });
 
-        res.json({ success: true, ticket, attachments: attachments.recordset, comments: comments.recordset, history: history.recordset });
+        const assets = await query(`
+            SELECT a.*, ac.category_name, u.full_name AS assigned_to_name
+            FROM ticket_assets ta
+            JOIN assets a ON ta.asset_id = a.asset_id
+            LEFT JOIN asset_categories ac ON a.category_id = ac.category_id
+            LEFT JOIN Users u ON a.assigned_to = u.user_id
+            WHERE ta.ticket_id = @id
+            ORDER BY ta.linked_at DESC
+        `, { id: { type: sql.Int, value: req.params.id } });
+
+        res.json({
+            success: true,
+            ticket,
+            attachments: attachments.recordset,
+            comments: comments.recordset,
+            history: history.recordset,
+            assets: assets.recordset,
+            linked_assets: assets.recordset
+        });
     } catch (err) {
         console.error(err);
         res.status(500).json({ success: false, message: 'Server error.' });
@@ -171,7 +285,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
 // POST /api/tickets — create ticket
 router.post('/', authenticateToken, upload.array('attachments', 5), async (req, res) => {
     try {
-        const { title, description, category_id, priority, department, due_date } = req.body;
+        const { title, description, category_id, priority, department, due_date, asset_id } = req.body;
         if (!title || !description) return res.status(400).json({ success: false, message: 'Title and description required.' });
 
         const ticketNumber = await generateTicketNumber();
@@ -192,6 +306,10 @@ router.post('/', authenticateToken, upload.array('attachments', 5), async (req, 
         });
 
         const ticketId = result.recordset[0].ticket_id;
+
+        if (asset_id) {
+            await linkTicketAsset(ticketId, Number(asset_id), req.user);
+        }
 
         // Save attachments
         if (req.files && req.files.length > 0) {
@@ -219,6 +337,9 @@ router.post('/', authenticateToken, upload.array('attachments', 5), async (req, 
 
         res.json({ success: true, message: 'Ticket created.', ticket_id: ticketId, ticket_number: ticketNumber });
     } catch (err) {
+        if (err.message?.toLowerCase().includes('asset')) {
+            return res.status(400).json({ success: false, message: err.message });
+        }
         console.error(err);
         res.status(500).json({ success: false, message: 'Server error.' });
     }
@@ -227,7 +348,7 @@ router.post('/', authenticateToken, upload.array('attachments', 5), async (req, 
 // PATCH /api/tickets/:id — update ticket (status, assign, etc.)
 router.patch('/:id', authenticateToken, async (req, res) => {
     try {
-        const { status, assigned_to, resolution_notes, priority, due_date } = req.body;
+        const { status, assigned_to, resolution_notes, priority, due_date, asset_id } = req.body;
         const ticketId = req.params.id;
 
         const existing = await query(`SELECT * FROM Tickets WHERE ticket_id = @id`, { id: { type: sql.Int, value: ticketId } });
@@ -257,14 +378,24 @@ router.patch('/:id', authenticateToken, async (req, res) => {
         if (resolution_notes) { updates.push('resolution_notes = @notes'); inputs.notes = { type: sql.NVarChar, value: resolution_notes }; }
         if (priority) { updates.push('priority = @priority'); inputs.priority = { type: sql.NVarChar, value: priority }; }
         if (due_date) { updates.push('due_date = @due'); inputs.due = { type: sql.DateTime, value: due_date }; }
+        if (asset_id !== undefined) {
+            await linkTicketAsset(ticketId, asset_id ? Number(asset_id) : null, req.user);
+        }
 
-        if (!updates.length) return res.status(400).json({ success: false, message: 'No updates provided.' });
+        if (!updates.length && asset_id === undefined) return res.status(400).json({ success: false, message: 'No updates provided.' });
 
-        updates.push('updated_at = GETDATE()');
-        await query(`UPDATE Tickets SET ${updates.join(', ')} WHERE ticket_id = @id`, inputs);
+        if (updates.length) {
+            updates.push('updated_at = GETDATE()');
+            await query(`UPDATE Tickets SET ${updates.join(', ')} WHERE ticket_id = @id`, inputs);
+        } else {
+            await query(`UPDATE Tickets SET updated_at = GETDATE() WHERE ticket_id = @id`, inputs);
+        }
 
         res.json({ success: true, message: 'Ticket updated.' });
     } catch (err) {
+        if (err.message?.toLowerCase().includes('asset')) {
+            return res.status(400).json({ success: false, message: err.message });
+        }
         console.error(err);
         res.status(500).json({ success: false, message: 'Server error.' });
     }
@@ -307,19 +438,6 @@ router.post('/:id/attachments', authenticateToken, upload.array('attachments', 5
             });
         }
         res.json({ success: true, message: `${req.files.length} file(s) uploaded.` });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ success: false, message: 'Server error.' });
-    }
-});
-
-// GET /api/tickets/attachment/:id/download
-router.get('/attachment/:id/download', authenticateToken, async (req, res) => {
-    try {
-        const result = await query(`SELECT * FROM TicketAttachments WHERE attachment_id = @id`, { id: { type: sql.Int, value: req.params.id } });
-        if (!result.recordset.length) return res.status(404).json({ success: false, message: 'File not found.' });
-        const file = result.recordset[0];
-        res.download(file.file_path, file.original_name);
     } catch (err) {
         console.error(err);
         res.status(500).json({ success: false, message: 'Server error.' });

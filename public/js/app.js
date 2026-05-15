@@ -355,6 +355,11 @@ async function openTicket(ticketId) {
     if (!data.success) return showToast(data.message, 'error');
 
     const { ticket: t, attachments, comments, history } = data;
+    const linkedAssets = data.linked_assets || data.assets || [];
+    const linkedAsset = linkedAssets[0] || null;
+    const assetData = await assetRequest('GET', '/');
+    const ticketAssetOptions = `<option value="">No linked asset</option>` +
+        (assetData.assets || []).map(a => `<option value="${a.asset_id}" ${linkedAsset && linkedAsset.asset_id === a.asset_id ? 'selected' : ''}>${escHtml(a.asset_tag)} - ${escHtml(a.asset_name)}</option>`).join('');
 
     let staffOptions = '';
     if (currentUser.can_assign_tickets) {
@@ -399,6 +404,23 @@ async function openTicket(ticketId) {
                                                 <a href="/api/tickets/attachment/${a.attachment_id}/download" class="btn btn-secondary btn-sm" style="text-decoration:none;">⬇ Download</a>
                                             </div>
                                         `).join('')}
+                                    </div>
+                                </div>` : ''}
+
+                                ${linkedAsset ? `
+                                <div style="margin-bottom:20px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:14px 16px;">
+                                    <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:10px;">
+                                        <div>
+                                            <div class="form-label" style="margin-bottom:2px;">Linked Asset</div>
+                                            <div class="ticket-link" onclick="closeModal('ticket-modal');openAssetDetails(${linkedAsset.asset_id})" style="cursor:pointer;">${escHtml(linkedAsset.asset_tag)} - ${escHtml(linkedAsset.asset_name)}</div>
+                                        </div>
+                                        ${assetStatusBadge(linkedAsset.status)}
+                                    </div>
+                                    <div class="form-row" style="margin-bottom:0;">
+                                        ${assetMetaBlock('Category', linkedAsset.category_name)}
+                                        ${assetMetaBlock('Assigned To', linkedAsset.assigned_to_name)}
+                                        ${assetMetaBlock('Brand / Model', [linkedAsset.brand, linkedAsset.model].filter(Boolean).join(' '))}
+                                        ${assetMetaBlock('Location', linkedAsset.location)}
                                     </div>
                                 </div>` : ''}
 
@@ -519,6 +541,12 @@ async function openTicket(ticketId) {
                                     <span class="ticket-meta-label">Assigned To</span>
                                     <span class="ticket-meta-value">${t.assigned_to_name || 'Unassigned'}</span>
                                 </div>`}
+                                <div class="ticket-meta-item">
+                                    <span class="ticket-meta-label">Linked Asset</span>
+                                    <select class="form-select" style="margin-top:4px;" onchange="updateTicketAsset(${t.ticket_id}, this.value)">
+                                        ${ticketAssetOptions}
+                                    </select>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -528,6 +556,17 @@ async function openTicket(ticketId) {
     `;
 
     document.body.insertAdjacentHTML('beforeend', modalHtml);
+}
+
+async function updateTicketAsset(ticketId, assetId) {
+    const data = await API.patch(`/tickets/${ticketId}`, { asset_id: assetId || null });
+    if (data.success) {
+        closeModal('ticket-modal');
+        showToast(assetId ? 'Asset linked!' : 'Asset unlinked!', 'success');
+        openTicket(ticketId);
+    } else {
+        showToast(data.message, 'error');
+    }
 }
 
 async function updateTicketStatus(id, status) {
@@ -577,12 +616,14 @@ function switchTab(group, activeId) {
 
 // ─── CREATE TICKET ───
 async function createTicketPage() {
-    const [catData, deptData] = await Promise.all([
+    const [catData, deptData, assetData] = await Promise.all([
         API.get('/users/categories'),
-        API.get('/users/departments')
+        API.get('/users/departments'),
+        assetRequest('GET', '/')
     ]);
     const cats = (catData.categories || []).filter(c => c.is_active);
     const depts = (deptData.departments || []).filter(d => d.is_active);
+    const assets = assetData.assets || [];
 
     // If admin/staff, fetch all users for "Request by" dropdown
     let usersForRequest = [];
@@ -647,6 +688,13 @@ async function createTicketPage() {
                                 <label class="form-label">Due Date</label>
                                 <input type="date" class="form-input" id="ct-due">
                             </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Linked Asset</label>
+                            <select class="form-select" id="ct-asset">
+                                <option value="">No linked asset</option>
+                                ${assets.map(a => `<option value="${a.asset_id}">${escHtml(a.asset_tag)} - ${escHtml(a.asset_name)}${a.assigned_to_name ? ' (' + escHtml(a.assigned_to_name) + ')' : ''}</option>`).join('')}
+                            </select>
                         </div>
                         <div class="form-group">
                             <label class="form-label">Description <span class="required">*</span></label>
@@ -733,6 +781,7 @@ async function submitCreateTicket(e) {
     fd.append('priority', document.getElementById('ct-priority').value);
     fd.append('department', document.getElementById('ct-department').value);
     fd.append('due_date', document.getElementById('ct-due').value);
+    fd.append('asset_id', document.getElementById('ct-asset')?.value || '');
     const requestBy = document.getElementById('ct-requestby')?.value;
     if (requestBy) fd.append('request_by', requestBy);
     selectedFiles.forEach(f => fd.append('attachments', f));
@@ -1363,3 +1412,787 @@ document.addEventListener('keydown', (e) => {
 const style = document.createElement('style');
 style.textContent = `@keyframes slideIn { from { transform: translateY(20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }`;
 document.head.appendChild(style);
+
+// --- ASSET MANAGEMENT MODULE ---
+let currentAssetId = null;
+let currentAssetFilters = {};
+
+const ASSET_STATUSES = ['Available', 'Assigned', 'Under Repair', 'Retired', 'Lost'];
+
+function canManageAssets() {
+    return ['Super Admin', 'Admin', 'Staff'].includes(currentUser?.role_name);
+}
+
+const coreSetupNav = setupNav;
+setupNav = function() {
+    coreSetupNav();
+    const nav = document.getElementById('sidebar-nav');
+    if (!nav || nav.querySelector('[data-page="assets"]')) return;
+
+    const usersNav = nav.querySelector('[data-page="users"]');
+    const item = document.createElement('div');
+    item.className = 'nav-item';
+    item.dataset.page = 'assets';
+    item.onclick = () => navigateTo('assets');
+    item.innerHTML = `
+        <span class="nav-icon">A</span>
+        <span>Assets</span>
+    `;
+
+    if (usersNav) nav.insertBefore(item, usersNav);
+    else nav.appendChild(item);
+};
+
+const coreNavigateTo = navigateTo;
+navigateTo = function(page) {
+    if (!['assets', 'add-asset', 'edit-asset', 'asset-details'].includes(page)) {
+        coreNavigateTo(page);
+        return;
+    }
+
+    currentPage = page;
+    document.querySelectorAll('.nav-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.page === 'assets');
+    });
+
+    const titles = {
+        assets: 'Asset Management',
+        'add-asset': 'Add Asset',
+        'edit-asset': 'Edit Asset',
+        'asset-details': 'Asset Details'
+    };
+    document.getElementById('page-title').textContent = titles[page] || 'Asset Management';
+    document.getElementById('page-content').innerHTML = '<div class="empty-state"><div class="empty-icon">...</div><p>Loading...</p></div>';
+
+    if (page === 'assets') assetsPage();
+    if (page === 'add-asset') addAssetPage();
+    if (page === 'edit-asset') editAssetPage(currentAssetId);
+    if (page === 'asset-details') assetDetailsPage(currentAssetId);
+};
+
+async function safeJson(endpoint, fallback = {}) {
+    try {
+        const res = await fetch(`/api${endpoint}`, { credentials: 'include' });
+        const type = res.headers.get('content-type') || '';
+        if (!type.includes('application/json')) return fallback;
+        const data = await res.json();
+        return data.success === false ? fallback : data;
+    } catch (err) {
+        return fallback;
+    }
+}
+
+async function assetRequest(method, endpoint, body = null) {
+    try {
+        const opts = {
+            method,
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' }
+        };
+        if (body) opts.body = JSON.stringify(body);
+        const res = await fetch(`/api/assets${endpoint}`, opts);
+        const type = res.headers.get('content-type') || '';
+        if (!type.includes('application/json')) {
+            return { success: false, message: 'Asset API is not available yet.' };
+        }
+        return await res.json();
+    } catch (err) {
+        return { success: false, message: 'Unable to connect to Asset API.' };
+    }
+}
+
+async function getAssetMeta() {
+    const [catData, deptData, userData] = await Promise.all([
+        assetRequest('GET', '/categories'),
+        safeJson('/users/departments', { departments: [] }),
+        canManageAssets() ? assetRequest('GET', '/assignable-users') : Promise.resolve({ users: [] })
+    ]);
+
+    return {
+        categories: catData.categories || catData.asset_categories || [],
+        departments: deptData.departments || [],
+        users: userData.users || []
+    };
+}
+
+async function assetsPage(filters = currentAssetFilters) {
+    currentAssetFilters = filters || {};
+    const params = new URLSearchParams();
+    if (currentAssetFilters.search) params.set('search', currentAssetFilters.search);
+    if (currentAssetFilters.status) params.set('status', currentAssetFilters.status);
+    if (currentAssetFilters.category_id) params.set('category_id', currentAssetFilters.category_id);
+    if (currentAssetFilters.department) params.set('department', currentAssetFilters.department);
+    if (currentAssetFilters.assigned_to) params.set('assigned_to', currentAssetFilters.assigned_to);
+
+    const [assetsData, meta] = await Promise.all([
+        assetRequest('GET', `/?${params.toString()}`),
+        getAssetMeta()
+    ]);
+
+    const assets = assetsData.assets || assetsData.data || [];
+    const stats = getAssetStats(assets);
+    const pageEl = document.getElementById('page-content');
+
+    pageEl.innerHTML = `
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">A</div>
+                <div class="stat-label">Total Assets</div>
+                <div class="stat-value">${stats.total}</div>
+            </div>
+            <div class="stat-card success">
+                <div class="stat-icon">OK</div>
+                <div class="stat-label">Available</div>
+                <div class="stat-value">${stats.available}</div>
+            </div>
+            <div class="stat-card accent">
+                <div class="stat-icon">IN</div>
+                <div class="stat-label">Assigned</div>
+                <div class="stat-value">${stats.assigned}</div>
+            </div>
+            <div class="stat-card warning">
+                <div class="stat-icon">RP</div>
+                <div class="stat-label">Under Repair</div>
+                <div class="stat-value">${stats.repair}</div>
+            </div>
+            <div class="stat-card danger">
+                <div class="stat-icon">!</div>
+                <div class="stat-label">Lost / Retired</div>
+                <div class="stat-value">${stats.inactive}</div>
+            </div>
+        </div>
+
+        <div class="filters-bar">
+            <div class="search-input-wrap">
+                <span class="search-icon">S</span>
+                <input type="text" placeholder="Search assets..." id="asset-search" value="${escHtml(currentAssetFilters.search || '')}">
+            </div>
+            <select class="filter-select" id="asset-status" onchange="applyAssetFilters()">
+                <option value="">All Status</option>
+                ${ASSET_STATUSES.map(s => `<option value="${s}" ${currentAssetFilters.status === s ? 'selected' : ''}>${s}</option>`).join('')}
+            </select>
+            <select class="filter-select" id="asset-category" onchange="applyAssetFilters()">
+                <option value="">All Categories</option>
+                ${meta.categories.map(c => `<option value="${c.category_id}" ${String(currentAssetFilters.category_id || '') === String(c.category_id) ? 'selected' : ''}>${escHtml(c.category_name)}</option>`).join('')}
+            </select>
+            <select class="filter-select" id="asset-department" onchange="applyAssetFilters()">
+                <option value="">All Departments</option>
+                ${meta.departments.map(d => `<option value="${escHtml(d.department_name)}" ${currentAssetFilters.department === d.department_name ? 'selected' : ''}>${escHtml(d.department_name)}</option>`).join('')}
+            </select>
+            <select class="filter-select" id="asset-assigned" onchange="applyAssetFilters()">
+                <option value="">All Users</option>
+                <option value="unassigned" ${currentAssetFilters.assigned_to === 'unassigned' ? 'selected' : ''}>Unassigned</option>
+                ${meta.users.map(u => `<option value="${u.user_id}" ${String(currentAssetFilters.assigned_to || '') === String(u.user_id) ? 'selected' : ''}>${escHtml(u.full_name)}</option>`).join('')}
+            </select>
+            ${canManageAssets() ? `<button class="btn btn-secondary btn-sm" onclick="openAllAssetActivityLogs()">Activity Logs</button>` : ''}
+            ${canManageAssets() ? `<button class="btn btn-primary btn-sm" onclick="navigateTo('add-asset')">Add Asset</button>` : ''}
+        </div>
+
+        <div id="asset-alert">${assetsData.success === false ? `<div class="alert alert-warning">${escHtml(assetsData.message || 'Asset API is not available yet.')}</div>` : ''}</div>
+        <div class="card">
+            <div class="table-wrapper">
+                ${assets.length ? renderAssetTable(assets) : '<div class="empty-state"><div class="empty-icon">A</div><h3>No assets found</h3><p>Try adjusting your filters.</p></div>'}
+            </div>
+        </div>
+    `;
+
+    let searchTimer;
+    document.getElementById('asset-search')?.addEventListener('input', () => {
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => applyAssetFilters(), 400);
+    });
+}
+
+function getAssetStats(assets) {
+    return {
+        total: assets.length,
+        available: assets.filter(a => a.status === 'Available').length,
+        assigned: assets.filter(a => a.status === 'Assigned').length,
+        repair: assets.filter(a => a.status === 'Under Repair').length,
+        inactive: assets.filter(a => ['Retired', 'Lost'].includes(a.status)).length
+    };
+}
+
+function applyAssetFilters() {
+    assetsPage({
+        search: document.getElementById('asset-search')?.value.trim(),
+        status: document.getElementById('asset-status')?.value,
+        category_id: document.getElementById('asset-category')?.value,
+        department: document.getElementById('asset-department')?.value,
+        assigned_to: document.getElementById('asset-assigned')?.value
+    });
+}
+
+function renderAssetTable(assets) {
+    return `
+        <table>
+            <thead>
+                <tr>
+                    <th>Asset Tag</th>
+                    <th>Asset</th>
+                    <th>Category</th>
+                    <th>Status</th>
+                    <th>Assigned To</th>
+                    <th>Department</th>
+                    <th>Location</th>
+                    <th>Warranty</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${assets.map(a => `
+                    <tr>
+                        <td><span class="ticket-number">${escHtml(a.asset_tag)}</span></td>
+                        <td onclick="openAssetDetails(${a.asset_id})" style="cursor:pointer;">
+                            <span class="ticket-link">${escHtml(a.asset_name)}</span>
+                            <div style="color:var(--text-muted);font-size:12px;">${escHtml([a.brand, a.model].filter(Boolean).join(' ') || a.serial_number || '')}</div>
+                        </td>
+                        <td>${escHtml(a.category_name || a.category || '-')}</td>
+                        <td>${assetStatusBadge(a.status)}</td>
+                        <td>${escHtml(a.assigned_to_name || a.assigned_user_name || '-')}</td>
+                        <td>${escHtml(a.department || '-')}</td>
+                        <td>${escHtml(a.location || '-')}</td>
+                        <td style="color:var(--text-muted);font-size:12px;">${formatDateOnly(a.warranty_expiry)}</td>
+                        <td>
+                            <div style="display:flex;gap:4px;flex-wrap:wrap;">
+                                <button class="btn btn-secondary btn-sm" onclick="openAssetDetails(${a.asset_id})">View</button>
+                                ${canManageAssets() ? `<button class="btn btn-secondary btn-sm" onclick="openEditAsset(${a.asset_id})">Edit</button>` : ''}
+                                ${canManageAssets() ? `<button class="btn btn-sm" style="background:var(--danger-light);color:var(--danger);" onclick="deleteAsset(${a.asset_id})">Retire</button>` : ''}
+                            </div>
+                        </td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+async function addAssetPage() {
+    if (!canManageAssets()) {
+        document.getElementById('page-content').innerHTML = '<div class="alert alert-error">Insufficient permissions.</div>';
+        return;
+    }
+    const meta = await getAssetMeta();
+    renderAssetForm({}, meta, false);
+}
+
+async function editAssetPage(assetId) {
+    if (!assetId) return navigateTo('assets');
+    if (!canManageAssets()) {
+        document.getElementById('page-content').innerHTML = '<div class="alert alert-error">Insufficient permissions.</div>';
+        return;
+    }
+    const [assetData, meta] = await Promise.all([
+        assetRequest('GET', `/${assetId}`),
+        getAssetMeta()
+    ]);
+    const asset = assetData.asset || {};
+    renderAssetForm(asset, meta, true);
+}
+
+function renderAssetForm(asset, meta, isEdit) {
+    document.getElementById('page-content').innerHTML = `
+        <div style="max-width:820px;">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">${isEdit ? 'Edit Asset' : 'Add Asset'}</span>
+                </div>
+                <div class="card-body">
+                    <div id="asset-form-alert"></div>
+                    <form id="asset-form">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Asset Tag <span class="required">*</span></label>
+                                <input class="form-input" id="asset-tag" value="${escHtml(asset.asset_tag || '')}" placeholder="AST-2026-0001" required>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Asset Name <span class="required">*</span></label>
+                                <input class="form-input" id="asset-name" value="${escHtml(asset.asset_name || '')}" placeholder="Dell Latitude 5450" required>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Category</label>
+                                <select class="form-select" id="asset-category-id">
+                                    <option value="">Select category...</option>
+                                    ${meta.categories.map(c => `<option value="${c.category_id}" ${String(asset.category_id || '') === String(c.category_id) ? 'selected' : ''}>${escHtml(c.category_name)}</option>`).join('')}
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Status</label>
+                                <select class="form-select" id="asset-form-status">
+                                    ${ASSET_STATUSES.map(s => `<option value="${s}" ${(asset.status || 'Available') === s ? 'selected' : ''}>${s}</option>`).join('')}
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Brand</label>
+                                <input class="form-input" id="asset-brand" value="${escHtml(asset.brand || '')}" placeholder="Dell">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Model</label>
+                                <input class="form-input" id="asset-model" value="${escHtml(asset.model || '')}" placeholder="Latitude 5450">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Serial Number</label>
+                                <input class="form-input" id="asset-serial" value="${escHtml(asset.serial_number || '')}" placeholder="Serial number">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Assigned User</label>
+                                <select class="form-select" id="asset-assigned-to">
+                                    <option value="">Unassigned</option>
+                                    ${meta.users.map(u => `<option value="${u.user_id}" ${String(asset.assigned_to || '') === String(u.user_id) ? 'selected' : ''}>${escHtml(u.full_name)}${u.department ? ' - ' + escHtml(u.department) : ''}</option>`).join('')}
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Department</label>
+                                <select class="form-select" id="asset-form-department">
+                                    <option value="">Select department...</option>
+                                    ${meta.departments.map(d => `<option value="${escHtml(d.department_name)}" ${asset.department === d.department_name ? 'selected' : ''}>${escHtml(d.department_name)}</option>`).join('')}
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Location</label>
+                                <input class="form-input" id="asset-location" value="${escHtml(asset.location || '')}" placeholder="HQ - 3rd Floor">
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Purchase Date</label>
+                                <input type="date" class="form-input" id="asset-purchase-date" value="${dateInputValue(asset.purchase_date)}">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Warranty Expiry</label>
+                                <input type="date" class="form-input" id="asset-warranty-expiry" value="${dateInputValue(asset.warranty_expiry)}">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Supplier</label>
+                            <input class="form-input" id="asset-supplier" value="${escHtml(asset.supplier || '')}" placeholder="Supplier or vendor">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Notes</label>
+                            <textarea class="form-textarea" id="asset-notes" rows="4" placeholder="Additional details...">${escHtml(asset.notes || '')}</textarea>
+                        </div>
+                        <div style="display:flex;gap:10px;">
+                            <button type="submit" class="btn btn-primary" id="asset-save-btn">${isEdit ? 'Save Changes' : 'Create Asset'}</button>
+                            <button type="button" class="btn btn-secondary" onclick="${isEdit ? `openAssetDetails(${asset.asset_id})` : `navigateTo('assets')`}">Cancel</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    `;
+    document.getElementById('asset-form').addEventListener('submit', e => submitAssetForm(e, asset.asset_id));
+}
+
+async function submitAssetForm(e, assetId = null) {
+    e.preventDefault();
+    const btn = document.getElementById('asset-save-btn');
+    const alertEl = document.getElementById('asset-form-alert');
+    const body = {
+        asset_tag: document.getElementById('asset-tag').value.trim(),
+        asset_name: document.getElementById('asset-name').value.trim(),
+        category_id: document.getElementById('asset-category-id').value || null,
+        brand: document.getElementById('asset-brand').value.trim(),
+        model: document.getElementById('asset-model').value.trim(),
+        serial_number: document.getElementById('asset-serial').value.trim(),
+        status: document.getElementById('asset-form-status').value,
+        assigned_to: document.getElementById('asset-assigned-to').value || null,
+        department: document.getElementById('asset-form-department').value,
+        location: document.getElementById('asset-location').value.trim(),
+        purchase_date: document.getElementById('asset-purchase-date').value || null,
+        warranty_expiry: document.getElementById('asset-warranty-expiry').value || null,
+        supplier: document.getElementById('asset-supplier').value.trim(),
+        notes: document.getElementById('asset-notes').value.trim()
+    };
+
+    if (!body.asset_tag || !body.asset_name) {
+        alertEl.innerHTML = '<div class="alert alert-error">Asset tag and asset name are required.</div>';
+        return;
+    }
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Saving...';
+    const data = assetId
+        ? await assetRequest('PATCH', `/${assetId}`, body)
+        : await assetRequest('POST', '/', body);
+
+    if (data.success) {
+        showToast(assetId ? 'Asset updated!' : 'Asset created!', 'success');
+        const id = assetId || data.asset_id || data.asset?.asset_id;
+        if (id) openAssetDetails(id);
+        else navigateTo('assets');
+    } else {
+        alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to save asset.')}</div>`;
+    }
+    btn.disabled = false;
+    btn.textContent = assetId ? 'Save Changes' : 'Create Asset';
+}
+
+function openAssetDetails(assetId) {
+    currentAssetId = assetId;
+    navigateTo('asset-details');
+}
+
+function openEditAsset(assetId) {
+    currentAssetId = assetId;
+    navigateTo('edit-asset');
+}
+
+async function deleteAsset(assetId) {
+    if (!canManageAssets()) return showToast('Insufficient permissions.', 'error');
+    if (!confirm('Retire this asset? It will be removed from active assignment.')) return;
+
+    const data = await assetRequest('DELETE', `/${assetId}`);
+    if (data.success) {
+        showToast('Asset retired.', 'success');
+        assetsPage();
+    } else {
+        showToast(data.message || 'Unable to retire asset.', 'error');
+    }
+}
+
+async function assetDetailsPage(assetId) {
+    if (!assetId) return navigateTo('assets');
+    const data = await assetRequest('GET', `/${assetId}`);
+    if (!data.success && !data.asset) {
+        document.getElementById('page-content').innerHTML = `
+            <div class="alert alert-error">${escHtml(data.message || 'Asset not found.')}</div>
+            <button class="btn btn-secondary" onclick="navigateTo('assets')">Back to Assets</button>
+        `;
+        return;
+    }
+
+    const asset = data.asset || data;
+    const assignments = data.assignments || data.assignment_history || [];
+    const maintenance = data.maintenance_logs || data.maintenance || [];
+    const tickets = data.tickets || [];
+    const activity = data.activity_logs || [];
+    document.getElementById('page-content').innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:10px;flex-wrap:wrap;">
+            <button class="btn btn-secondary btn-sm" onclick="navigateTo('assets')">Back</button>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                ${canManageAssets() ? `<button class="btn btn-secondary btn-sm" onclick="openMaintenanceModal(${asset.asset_id})">Add Maintenance</button>` : ''}
+                ${canManageAssets() ? `<button class="btn btn-primary btn-sm" onclick="openEditAsset(${asset.asset_id})">Edit Asset</button>` : ''}
+                ${canManageAssets() ? `<button class="btn btn-sm" style="background:var(--danger-light);color:var(--danger);" onclick="deleteAsset(${asset.asset_id})">Retire</button>` : ''}
+            </div>
+        </div>
+
+        <div class="card" style="margin-bottom:20px;">
+            <div class="card-header">
+                <div>
+                    <span class="ticket-number">${escHtml(asset.asset_tag)}</span>
+                    <div class="card-title" style="margin-top:4px;">${escHtml(asset.asset_name)}</div>
+                </div>
+                ${assetStatusBadge(asset.status)}
+            </div>
+            <div class="card-body">
+                <div class="ticket-detail-grid">
+                    <div>
+                        <div class="tabs">
+                            <button class="tab-btn active" onclick="switchAssetDetailTab('asset-tab-details')">Details</button>
+                            <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-tickets')">Tickets (${tickets.length})</button>
+                            <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-assignments')">Assignments (${assignments.length})</button>
+                            <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-maintenance')">Maintenance (${maintenance.length})</button>
+                            ${canManageAssets() ? `<button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-activity')">Activity (${activity.length})</button>` : ''}
+                        </div>
+                        <div id="asset-tab-details">
+                            <p style="color:var(--text-secondary);font-size:13.5px;line-height:1.7;margin-bottom:20px;">${escHtml(asset.notes || 'No notes recorded for this asset.')}</p>
+                            <div class="form-row">
+                                ${assetMetaBlock('Brand', asset.brand)}
+                                ${assetMetaBlock('Model', asset.model)}
+                                ${assetMetaBlock('Serial Number', asset.serial_number)}
+                                ${assetMetaBlock('Supplier', asset.supplier)}
+                                ${assetMetaBlock('Purchase Date', formatDateOnly(asset.purchase_date))}
+                                ${assetMetaBlock('Warranty Expiry', formatDateOnly(asset.warranty_expiry))}
+                            </div>
+                        </div>
+                        <div id="asset-tab-tickets" class="hidden">
+                            ${renderAssetTicketHistory(tickets)}
+                        </div>
+                        <div id="asset-tab-assignments" class="hidden">
+                            ${renderAssignmentHistory(assignments)}
+                        </div>
+                        <div id="asset-tab-maintenance" class="hidden">
+                            ${renderMaintenanceLogs(maintenance)}
+                        </div>
+                        ${canManageAssets() ? `<div id="asset-tab-activity" class="hidden">${renderAssetActivityLogs(activity)}</div>` : ''}
+                    </div>
+                    <div>
+                        ${assetSideMeta('Category', asset.category_name || asset.category)}
+                        ${assetSideMeta('Assigned To', asset.assigned_to_name || asset.assigned_user_name)}
+                        ${assetSideMeta('Department', asset.department)}
+                        ${assetSideMeta('Location', asset.location)}
+                        ${assetSideMeta('Created', formatDate(asset.created_at))}
+                        ${assetSideMeta('Updated', formatDate(asset.updated_at))}
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function switchAssetDetailTab(activeId) {
+    ['asset-tab-details','asset-tab-tickets','asset-tab-assignments','asset-tab-maintenance','asset-tab-activity'].forEach(id => {
+        document.getElementById(id)?.classList.toggle('hidden', id !== activeId);
+    });
+    document.querySelectorAll('#page-content .tabs .tab-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.getAttribute('onclick').includes(activeId));
+    });
+}
+
+function renderAssetTicketHistory(tickets) {
+    if (!tickets.length) return '<div class="empty-state"><div class="empty-icon">A</div><h3>No linked tickets</h3></div>';
+    return `
+        <div class="table-wrapper">
+            <table>
+                <thead><tr><th>Ticket #</th><th>Title</th><th>Status</th><th>Priority</th><th>Created By</th><th>Created</th></tr></thead>
+                <tbody>
+                    ${tickets.map(t => `
+                        <tr onclick="openTicket(${t.ticket_id})" style="cursor:pointer;">
+                            <td><span class="ticket-number">${escHtml(t.ticket_number)}</span></td>
+                            <td><span class="ticket-link">${escHtml(t.title)}</span></td>
+                            <td>${statusBadge(t.status)}</td>
+                            <td>${priorityBadge(t.priority)}</td>
+                            <td>${escHtml(t.created_by_name || '-')}</td>
+                            <td style="color:var(--text-muted);font-size:12px;">${formatDate(t.created_at)}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function assetMetaBlock(label, value) {
+    return `
+        <div class="form-group">
+            <label class="form-label">${label}</label>
+            <div style="font-size:13.5px;color:var(--text-primary);">${escHtml(value || '-')}</div>
+        </div>
+    `;
+}
+
+function assetSideMeta(label, value) {
+    return `
+        <div class="ticket-meta-item">
+            <div class="ticket-meta-label">${label}</div>
+            <div class="ticket-meta-value">${escHtml(value || '-')}</div>
+        </div>
+    `;
+}
+
+function renderAssignmentHistory(assignments) {
+    if (!assignments.length) return '<div class="empty-state"><div class="empty-icon">A</div><h3>No assignment history</h3></div>';
+    return `
+        <div class="table-wrapper">
+            <table>
+                <thead><tr><th>Assigned To</th><th>Department</th><th>Location</th><th>Assigned</th><th>Returned</th></tr></thead>
+                <tbody>
+                    ${assignments.map(a => `
+                        <tr>
+                            <td>${escHtml(a.assigned_to_name || a.full_name || '-')}</td>
+                            <td>${escHtml(a.department || '-')}</td>
+                            <td>${escHtml(a.location || '-')}</td>
+                            <td style="color:var(--text-muted);font-size:12px;">${formatDate(a.assigned_at)}</td>
+                            <td style="color:var(--text-muted);font-size:12px;">${formatDate(a.returned_at)}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function renderMaintenanceLogs(logs) {
+    if (!logs.length) return '<div class="empty-state"><div class="empty-icon">A</div><h3>No maintenance logs</h3></div>';
+    return `
+        <div class="table-wrapper">
+            <table>
+                <thead><tr><th>Type</th><th>Description</th><th>Status</th><th>Vendor</th><th>Date</th><th>Cost</th></tr></thead>
+                <tbody>
+                    ${logs.map(l => `
+                        <tr>
+                            <td>${escHtml(l.maintenance_type || '-')}</td>
+                            <td>${escHtml(l.description || '-')}</td>
+                            <td>${assetMaintenanceBadge(l.status)}</td>
+                            <td>${escHtml(l.vendor || '-')}</td>
+                            <td style="color:var(--text-muted);font-size:12px;">${formatDate(l.maintenance_date)}</td>
+                            <td>${l.cost ? escHtml(Number(l.cost).toLocaleString('en-PH', { style: 'currency', currency: 'PHP' })) : '-'}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function renderAssetActivityLogs(logs) {
+    if (!logs.length) return '<div class="empty-state"><div class="empty-icon">A</div><h3>No activity logs</h3></div>';
+    return `
+        <div style="display:flex;flex-direction:column;gap:8px;">
+            ${logs.map(l => `
+                <div style="display:flex;gap:12px;align-items:flex-start;">
+                    <div style="width:6px;height:6px;background:var(--accent);border-radius:50%;margin-top:6px;flex-shrink:0;"></div>
+                    <div>
+                        <div style="font-size:13px;"><strong>${escHtml(l.changed_by_name || 'System')}</strong> - ${escHtml(l.action)}</div>
+                        <div style="font-size:12px;color:var(--text-muted);">${escHtml(l.old_value || '-')} -> ${escHtml(l.new_value || '-')}</div>
+                        <div style="font-size:11px;color:var(--text-muted);">${formatDate(l.created_at)}</div>
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+async function openAllAssetActivityLogs() {
+    if (!canManageAssets()) return showToast('Insufficient permissions.', 'error');
+    const data = await assetRequest('GET', '/activity-logs');
+    const logs = data.activity_logs || [];
+    const html = `
+        <div class="modal-overlay active" id="asset-activity-modal">
+            <div class="modal modal-lg">
+                <div class="modal-header">
+                    <span class="modal-title">Asset Activity Logs</span>
+                    <button class="modal-close" onclick="closeModal('asset-activity-modal')">x</button>
+                </div>
+                <div class="modal-body">
+                    ${logs.length ? `
+                    <div class="table-wrapper">
+                        <table>
+                            <thead><tr><th>Asset</th><th>Action</th><th>Changed By</th><th>Old</th><th>New</th><th>Date</th></tr></thead>
+                            <tbody>
+                                ${logs.map(l => `
+                                    <tr>
+                                        <td><span class="ticket-number">${escHtml(l.asset_tag)}</span><div>${escHtml(l.asset_name)}</div></td>
+                                        <td>${escHtml(l.action)}</td>
+                                        <td>${escHtml(l.changed_by_name || 'System')}</td>
+                                        <td style="color:var(--text-muted);font-size:12px;">${escHtml(l.old_value || '-')}</td>
+                                        <td style="color:var(--text-muted);font-size:12px;">${escHtml(l.new_value || '-')}</td>
+                                        <td style="color:var(--text-muted);font-size:12px;">${formatDate(l.created_at)}</td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>` : '<div class="empty-state"><div class="empty-icon">A</div><h3>No activity logs</h3></div>'}
+                </div>
+            </div>
+        </div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+}
+
+function openMaintenanceModal(assetId) {
+    if (!canManageAssets()) return showToast('Insufficient permissions.', 'error');
+    const html = `
+        <div class="modal-overlay active" id="maintenance-modal">
+            <div class="modal">
+                <div class="modal-header">
+                    <span class="modal-title">Add Maintenance Log</span>
+                    <button class="modal-close" onclick="closeModal('maintenance-modal')">x</button>
+                </div>
+                <div class="modal-body">
+                    <div id="maintenance-alert"></div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label">Type</label>
+                            <input class="form-input" id="ml-type" placeholder="Repair, cleaning, upgrade">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Status</label>
+                            <select class="form-select" id="ml-status">
+                                <option value="Completed">Completed</option>
+                                <option value="Scheduled">Scheduled</option>
+                                <option value="In Progress">In Progress</option>
+                                <option value="Cancelled">Cancelled</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Description <span class="required">*</span></label>
+                        <textarea class="form-textarea" id="ml-description" rows="4" placeholder="What was done?"></textarea>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label">Vendor</label>
+                            <input class="form-input" id="ml-vendor" placeholder="Vendor or supplier">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Cost</label>
+                            <input type="number" step="0.01" class="form-input" id="ml-cost" placeholder="0.00">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Notes</label>
+                        <textarea class="form-textarea" id="ml-notes" rows="2" placeholder="Additional notes..."></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="closeModal('maintenance-modal')">Cancel</button>
+                    <button class="btn btn-primary" onclick="submitMaintenanceLog(${assetId})">Save Log</button>
+                </div>
+            </div>
+        </div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+}
+
+async function submitMaintenanceLog(assetId) {
+    const alertEl = document.getElementById('maintenance-alert');
+    const body = {
+        maintenance_type: document.getElementById('ml-type').value.trim(),
+        status: document.getElementById('ml-status').value,
+        description: document.getElementById('ml-description').value.trim(),
+        vendor: document.getElementById('ml-vendor').value.trim(),
+        cost: document.getElementById('ml-cost').value || null,
+        notes: document.getElementById('ml-notes').value.trim()
+    };
+    if (!body.description) {
+        alertEl.innerHTML = '<div class="alert alert-error">Maintenance description required.</div>';
+        return;
+    }
+    const data = await assetRequest('POST', `/${assetId}/maintenance`, body);
+    if (data.success) {
+        closeModal('maintenance-modal');
+        showToast('Maintenance log added.', 'success');
+        openAssetDetails(assetId);
+    } else {
+        alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to save maintenance log.')}</div>`;
+    }
+}
+
+function assetStatusBadge(status) {
+    const map = {
+        Available: 'resolved',
+        Assigned: 'normal',
+        'Under Repair': 'pending',
+        Retired: 'closed',
+        Lost: 'urgent'
+    };
+    return `<span class="badge badge-${map[status] || 'normal'}">${escHtml(status || 'Available')}</span>`;
+}
+
+function assetMaintenanceBadge(status) {
+    const map = {
+        Scheduled: 'normal',
+        'In Progress': 'pending',
+        Completed: 'resolved',
+        Cancelled: 'closed'
+    };
+    return `<span class="badge badge-${map[status] || 'normal'}">${escHtml(status || 'Completed')}</span>`;
+}
+
+function dateInputValue(dateStr) {
+    if (!dateStr) return '';
+    return String(dateStr).slice(0, 10);
+}
+
+function formatDateOnly(dateStr) {
+    if (!dateStr) return '-';
+    const d = new Date(dateStr);
+    return d.toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: 'numeric' });
+}
