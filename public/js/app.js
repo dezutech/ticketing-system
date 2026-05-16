@@ -54,6 +54,7 @@ function toggleTheme() {
 function showLogin() {
     document.getElementById('login-page').classList.remove('hidden');
     document.getElementById('app-layout').classList.add('hidden');
+    resetLoginButton();
 }
 
 function showApp() {
@@ -62,6 +63,13 @@ function showApp() {
     renderUserInfo();
     setupNav();
     navigateTo('dashboard');
+}
+
+function resetLoginButton() {
+    const btn = document.getElementById('login-btn');
+    if (!btn) return;
+    btn.disabled = false;
+    btn.textContent = 'Sign In';
 }
 
 async function handleLogin(e) {
@@ -75,15 +83,20 @@ async function handleLogin(e) {
     btn.innerHTML = '<span class="spinner"></span> Signing in...';
     err.classList.add('hidden');
 
-    const data = await API.post('/auth/login', { username, password });
-    if (data.success) {
-        currentUser = data.user;
-        showApp();
-    } else {
-        err.textContent = data.message;
+    try {
+        const data = await API.post('/auth/login', { username, password });
+        if (data.success) {
+            currentUser = data.user;
+            showApp();
+        } else {
+            err.textContent = data.message;
+            err.classList.remove('hidden');
+            resetLoginButton();
+        }
+    } catch (error) {
+        err.textContent = 'Unable to sign in. Please try again.';
         err.classList.remove('hidden');
-        btn.disabled = false;
-        btn.textContent = 'Sign In';
+        resetLoginButton();
     }
 }
 

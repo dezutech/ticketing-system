@@ -47,6 +47,14 @@ function isMissingObjectError(err) {
     return err?.number === 208 || /invalid object name/i.test(err?.message || '');
 }
 
+function nullableString(value) {
+    return value === undefined || value === null || value === '' ? null : String(value);
+}
+
+function nullableInt(value) {
+    return value === undefined || value === null || value === '' ? null : Number(value);
+}
+
 async function linkTicketAsset(ticketId, assetId, user) {
     if (assetId && !Number.isInteger(Number(assetId))) {
         throw new Error('Invalid asset selected.');
@@ -381,10 +389,15 @@ router.patch('/:id', authenticateToken, async (req, res) => {
                 { id: { type: sql.Int, value: ticketId }, uid: { type: sql.Int, value: req.user.user_id }, old: { type: sql.NVarChar, value: ticket.status }, new: { type: sql.NVarChar, value: status } });
         }
         if (assigned_to !== undefined && req.user.can_assign_tickets) {
+            const assignedTo = nullableInt(assigned_to);
+            if (assignedTo !== null && !Number.isInteger(assignedTo)) {
+                return res.status(400).json({ success: false, message: 'Invalid assigned user.' });
+            }
+
             updates.push('assigned_to = @assignedTo');
-            inputs.assignedTo = { type: sql.Int, value: assigned_to || null };
+            inputs.assignedTo = { type: sql.Int, value: assignedTo };
             await query(`INSERT INTO TicketHistory (ticket_id, changed_by, field_changed, old_value, new_value) VALUES (@id, @uid, 'assigned_to', @old, @new)`,
-                { id: { type: sql.Int, value: ticketId }, uid: { type: sql.Int, value: req.user.user_id }, old: { type: sql.NVarChar, value: ticket.assigned_to }, new: { type: sql.NVarChar, value: assigned_to } });
+                { id: { type: sql.Int, value: ticketId }, uid: { type: sql.Int, value: req.user.user_id }, old: { type: sql.NVarChar, value: nullableString(ticket.assigned_to) }, new: { type: sql.NVarChar, value: nullableString(assignedTo) } });
         }
         if (resolution_notes) { updates.push('resolution_notes = @notes'); inputs.notes = { type: sql.NVarChar, value: resolution_notes }; }
         if (priority) { updates.push('priority = @priority'); inputs.priority = { type: sql.NVarChar, value: priority }; }
