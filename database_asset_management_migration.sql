@@ -46,7 +46,7 @@ BEGIN
         model NVARCHAR(100),
         serial_number NVARCHAR(100),
         status NVARCHAR(30) NOT NULL DEFAULT 'Available'
-            CHECK (status IN ('Available', 'Assigned', 'Under Repair', 'Retired', 'Lost')),
+            CHECK (status IN ('Available', 'Assigned', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost')),
         assigned_to INT,
         department NVARCHAR(100),
         location NVARCHAR(150),
@@ -64,6 +64,33 @@ BEGIN
     CREATE INDEX IX_assets_category_id ON assets(category_id);
     CREATE INDEX IX_assets_assigned_to ON assets(assigned_to);
     CREATE INDEX IX_assets_department ON assets(department);
+END
+GO
+
+-- Extend existing asset status check constraints to include Returned and Pulled Out.
+DECLARE @AssetStatusConstraint NVARCHAR(128);
+SELECT TOP 1 @AssetStatusConstraint = cc.name
+FROM sys.check_constraints cc
+JOIN sys.tables t ON cc.parent_object_id = t.object_id
+JOIN sys.columns c ON cc.parent_object_id = c.object_id AND cc.parent_column_id = c.column_id
+WHERE t.name = 'assets' AND c.name = 'status';
+
+IF @AssetStatusConstraint IS NOT NULL
+BEGIN
+    DECLARE @DropAssetStatusSql NVARCHAR(MAX);
+    SET @DropAssetStatusSql = N'ALTER TABLE assets DROP CONSTRAINT ' + QUOTENAME(@AssetStatusConstraint);
+    EXEC sp_executesql @DropAssetStatusSql;
+END
+
+IF NOT EXISTS (
+    SELECT 1
+    FROM sys.check_constraints cc
+    JOIN sys.tables t ON cc.parent_object_id = t.object_id
+    WHERE t.name = 'assets' AND cc.definition LIKE '%Pulled Out%'
+)
+BEGIN
+    ALTER TABLE assets ADD CONSTRAINT CK_assets_status
+    CHECK (status IN ('Available', 'Assigned', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'));
 END
 GO
 
@@ -93,6 +120,23 @@ BEGIN
     CREATE INDEX IX_asset_assignments_asset_id ON asset_assignments(asset_id);
     CREATE INDEX IX_asset_assignments_assigned_to ON asset_assignments(assigned_to);
     CREATE INDEX IX_asset_assignments_returned_at ON asset_assignments(returned_at);
+END
+GO
+
+IF EXISTS (SELECT * FROM sys.tables WHERE name = 'asset_assignments')
+BEGIN
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('asset_assignments') AND name = 'return_status')
+        ALTER TABLE asset_assignments ADD return_status NVARCHAR(30) NULL;
+
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('asset_assignments') AND name = 'return_ticket_id')
+        ALTER TABLE asset_assignments ADD return_ticket_id INT NULL;
+
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('asset_assignments') AND name = 'return_notes')
+        ALTER TABLE asset_assignments ADD return_notes NVARCHAR(MAX) NULL;
+
+    IF NOT EXISTS (SELECT * FROM sys.foreign_keys WHERE name = 'FK_asset_assignments_return_ticket')
+        ALTER TABLE asset_assignments ADD CONSTRAINT FK_asset_assignments_return_ticket
+        FOREIGN KEY (return_ticket_id) REFERENCES Tickets(ticket_id);
 END
 GO
 
@@ -126,6 +170,20 @@ BEGIN
 END
 GO
 
+IF EXISTS (SELECT * FROM sys.tables WHERE name = 'asset_activity_logs')
+BEGIN
+    IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('asset_activity_logs') AND name = 'ticket_id')
+        ALTER TABLE asset_activity_logs ADD ticket_id INT NULL;
+
+    IF NOT EXISTS (SELECT * FROM sys.foreign_keys WHERE name = 'FK_asset_activity_logs_ticket')
+        ALTER TABLE asset_activity_logs ADD CONSTRAINT FK_asset_activity_logs_ticket
+        FOREIGN KEY (ticket_id) REFERENCES Tickets(ticket_id);
+
+    IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_asset_activity_logs_ticket_id' AND object_id = OBJECT_ID('asset_activity_logs'))
+        CREATE INDEX IX_asset_activity_logs_ticket_id ON asset_activity_logs(ticket_id);
+END
+GO
+
 -- ============================================
 -- ASSET ACTIVITY LOGS TABLE
 -- ============================================
@@ -146,6 +204,30 @@ BEGIN
     CREATE INDEX IX_asset_activity_logs_asset_id ON asset_activity_logs(asset_id);
     CREATE INDEX IX_asset_activity_logs_action ON asset_activity_logs(action);
     CREATE INDEX IX_asset_activity_logs_created_at ON asset_activity_logs(created_at);
+END
+GO
+
+-- ============================================
+-- ASSET ATTACHMENTS TABLE
+-- ============================================
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'asset_attachments')
+BEGIN
+    CREATE TABLE asset_attachments (
+        attachment_id INT PRIMARY KEY IDENTITY(1,1),
+        asset_id INT NOT NULL,
+        file_name NVARCHAR(255) NOT NULL,
+        original_name NVARCHAR(255) NOT NULL,
+        file_type NVARCHAR(100),
+        file_size BIGINT,
+        file_path NVARCHAR(500) NOT NULL,
+        uploaded_by INT,
+        uploaded_at DATETIME DEFAULT GETDATE(),
+        FOREIGN KEY (asset_id) REFERENCES assets(asset_id) ON DELETE CASCADE,
+        FOREIGN KEY (uploaded_by) REFERENCES Users(user_id)
+    );
+
+    CREATE INDEX IX_asset_attachments_asset_id ON asset_attachments(asset_id);
+    CREATE INDEX IX_asset_attachments_uploaded_at ON asset_attachments(uploaded_at);
 END
 GO
 

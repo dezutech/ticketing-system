@@ -43,6 +43,10 @@ function canManageAssets(user) {
     return ['Super Admin', 'Admin', 'Staff'].includes(user?.role_name);
 }
 
+function isMissingObjectError(err) {
+    return err?.number === 208 || /invalid object name/i.test(err?.message || '');
+}
+
 async function linkTicketAsset(ticketId, assetId, user) {
     if (assetId && !Number.isInteger(Number(assetId))) {
         throw new Error('Invalid asset selected.');
@@ -257,15 +261,22 @@ router.get('/:id', authenticateToken, async (req, res) => {
             WHERE th.ticket_id = @id ORDER BY th.changed_at DESC
         `, { id: { type: sql.Int, value: req.params.id } });
 
-        const assets = await query(`
-            SELECT a.*, ac.category_name, u.full_name AS assigned_to_name
-            FROM ticket_assets ta
-            JOIN assets a ON ta.asset_id = a.asset_id
-            LEFT JOIN asset_categories ac ON a.category_id = ac.category_id
-            LEFT JOIN Users u ON a.assigned_to = u.user_id
-            WHERE ta.ticket_id = @id
-            ORDER BY ta.linked_at DESC
-        `, { id: { type: sql.Int, value: req.params.id } });
+        let linkedAssets = [];
+        try {
+            const assets = await query(`
+                SELECT a.*, ac.category_name, u.full_name AS assigned_to_name
+                FROM ticket_assets ta
+                JOIN assets a ON ta.asset_id = a.asset_id
+                LEFT JOIN asset_categories ac ON a.category_id = ac.category_id
+                LEFT JOIN Users u ON a.assigned_to = u.user_id
+                WHERE ta.ticket_id = @id
+                ORDER BY ta.linked_at DESC
+            `, { id: { type: sql.Int, value: req.params.id } });
+            linkedAssets = assets.recordset;
+        } catch (err) {
+            if (!isMissingObjectError(err)) throw err;
+            console.warn('Asset tables not found; returning ticket without linked assets.');
+        }
 
         res.json({
             success: true,
@@ -273,8 +284,8 @@ router.get('/:id', authenticateToken, async (req, res) => {
             attachments: attachments.recordset,
             comments: comments.recordset,
             history: history.recordset,
-            assets: assets.recordset,
-            linked_assets: assets.recordset
+            assets: linkedAssets,
+            linked_assets: linkedAssets
         });
     } catch (err) {
         console.error(err);

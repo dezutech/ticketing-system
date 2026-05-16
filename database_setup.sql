@@ -63,7 +63,7 @@ BEGIN
     -- Default super admin (password: Admin@123 - CHANGE THIS!)
     -- bcrypt hash for 'Admin@123'
     INSERT INTO Users (username, email, password_hash, full_name, role_id, department)
-    VALUES ('superadmin', 'superadmin@company.com', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'Super Administrator', 1, 'IT');
+    VALUES ('superadmin', 'superadmin@company.com', '$2a$10$urExMb1MTcojLGBbG/YUWO4TnUN5PfrQ9finfFi5h37jMI0t/unFy', 'Super Administrator', 1, 'IT');
 END
 GO
 

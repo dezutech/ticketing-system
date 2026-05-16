@@ -616,9 +616,10 @@ function switchTab(group, activeId) {
 
 // ─── CREATE TICKET ───
 async function createTicketPage() {
+    try {
     const [catData, deptData, assetData] = await Promise.all([
-        API.get('/users/categories'),
-        API.get('/users/departments'),
+        safeJson('/users/categories', { categories: [] }),
+        safeJson('/users/departments', { departments: [] }),
         assetRequest('GET', '/')
     ]);
     const cats = (catData.categories || []).filter(c => c.is_active);
@@ -628,7 +629,7 @@ async function createTicketPage() {
     // If admin/staff, fetch all users for "Request by" dropdown
     let usersForRequest = [];
     if (currentUser.can_assign_tickets) {
-        const ud = await API.get('/users/all-users');
+        const ud = await safeJson('/users/all-users', { users: [] });
         usersForRequest = ud.users || [];
     }
 
@@ -720,7 +721,16 @@ async function createTicketPage() {
         </div>
     `;
 
+    selectedFiles = [];
     document.getElementById('create-ticket-form').addEventListener('submit', submitCreateTicket);
+    } catch (err) {
+        console.error('Create ticket page error:', err);
+        document.getElementById('page-content').innerHTML = `
+            <div class="alert alert-error">
+                Unable to load the New Ticket form. Please refresh and try again.
+            </div>
+        `;
+    }
 }
 
 let selectedFiles = [];
@@ -806,6 +816,12 @@ async function usersPage() {
         API.get('/users'), API.get('/users/roles'),
         API.get('/users/categories'), API.get('/users/departments')
     ]);
+    if (usersData.success === false && !usersData.users) {
+        currentUser.can_manage_users = false;
+        setupNav();
+        document.getElementById('page-content').innerHTML = `<div class="alert alert-error">${escHtml(usersData.message || 'Insufficient permissions.')}</div>`;
+        return;
+    }
     const users = usersData.users || [];
     const roles = rolesData.roles || [];
     const cats = catsData.categories || [];
@@ -1416,8 +1432,9 @@ document.head.appendChild(style);
 // --- ASSET MANAGEMENT MODULE ---
 let currentAssetId = null;
 let currentAssetFilters = {};
+let selectedAssetFiles = [];
 
-const ASSET_STATUSES = ['Available', 'Assigned', 'Under Repair', 'Retired', 'Lost'];
+const ASSET_STATUSES = ['Available', 'Assigned', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'];
 
 function canManageAssets() {
     return ['Super Admin', 'Admin', 'Staff'].includes(currentUser?.role_name);
@@ -1482,14 +1499,14 @@ async function safeJson(endpoint, fallback = {}) {
     }
 }
 
-async function assetRequest(method, endpoint, body = null) {
+async function assetRequest(method, endpoint, body = null, isFormData = false) {
     try {
         const opts = {
             method,
             credentials: 'include',
-            headers: { 'Content-Type': 'application/json' }
+            headers: isFormData ? {} : { 'Content-Type': 'application/json' }
         };
-        if (body) opts.body = JSON.stringify(body);
+        if (body) opts.body = isFormData ? body : JSON.stringify(body);
         const res = await fetch(`/api/assets${endpoint}`, opts);
         const type = res.headers.get('content-type') || '';
         if (!type.includes('application/json')) {
@@ -1530,8 +1547,34 @@ async function assetsPage(filters = currentAssetFilters) {
     ]);
 
     const assets = assetsData.assets || assetsData.data || [];
+    const returnedAssets = assetsData.returned_assets || assetsData.asset_history || [];
     const stats = getAssetStats(assets);
     const pageEl = document.getElementById('page-content');
+
+    if (!canManageAssets()) {
+        pageEl.innerHTML = `
+            <div id="asset-alert">${assetsData.success === false ? `<div class="alert alert-warning">${escHtml(assetsData.message || 'Asset API is not available yet.')}</div>` : ''}</div>
+
+            <div class="card" style="margin-bottom:20px;">
+                <div class="card-header">
+                    <span class="card-title">Current Assigned Assets</span>
+                </div>
+                <div class="table-wrapper">
+                    ${assets.length ? renderAssetTable(assets, { userView: true }) : '<div class="empty-state"><div class="empty-icon">A</div><h3>No current assigned assets</h3></div>'}
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Returned / Pulled Out Asset History</span>
+                </div>
+                <div class="table-wrapper">
+                    ${returnedAssets.length ? renderReturnedAssetTable(returnedAssets) : '<div class="empty-state"><div class="empty-icon">A</div><h3>No returned assets yet</h3></div>'}
+                </div>
+            </div>
+        `;
+        return;
+    }
 
     pageEl.innerHTML = `
         <div class="stats-grid">
@@ -1557,7 +1600,7 @@ async function assetsPage(filters = currentAssetFilters) {
             </div>
             <div class="stat-card danger">
                 <div class="stat-icon">!</div>
-                <div class="stat-label">Lost / Retired</div>
+                <div class="stat-label">Inactive / History</div>
                 <div class="stat-value">${stats.inactive}</div>
             </div>
         </div>
@@ -1609,7 +1652,7 @@ function getAssetStats(assets) {
         available: assets.filter(a => a.status === 'Available').length,
         assigned: assets.filter(a => a.status === 'Assigned').length,
         repair: assets.filter(a => a.status === 'Under Repair').length,
-        inactive: assets.filter(a => ['Retired', 'Lost'].includes(a.status)).length
+        inactive: assets.filter(a => ['Returned', 'Pulled Out', 'Retired', 'Lost'].includes(a.status)).length
     };
 }
 
@@ -1623,7 +1666,7 @@ function applyAssetFilters() {
     });
 }
 
-function renderAssetTable(assets) {
+function renderAssetTable(assets, opts = {}) {
     return `
         <table>
             <thead>
@@ -1632,7 +1675,7 @@ function renderAssetTable(assets) {
                     <th>Asset</th>
                     <th>Category</th>
                     <th>Status</th>
-                    <th>Assigned To</th>
+                    ${opts.userView ? '' : '<th>Assigned To</th>'}
                     <th>Department</th>
                     <th>Location</th>
                     <th>Warranty</th>
@@ -1649,7 +1692,7 @@ function renderAssetTable(assets) {
                         </td>
                         <td>${escHtml(a.category_name || a.category || '-')}</td>
                         <td>${assetStatusBadge(a.status)}</td>
-                        <td>${escHtml(a.assigned_to_name || a.assigned_user_name || '-')}</td>
+                        ${opts.userView ? '' : `<td>${escHtml(a.assigned_to_name || a.assigned_user_name || '-')}</td>`}
                         <td>${escHtml(a.department || '-')}</td>
                         <td>${escHtml(a.location || '-')}</td>
                         <td style="color:var(--text-muted);font-size:12px;">${formatDateOnly(a.warranty_expiry)}</td>
@@ -1660,6 +1703,40 @@ function renderAssetTable(assets) {
                                 ${canManageAssets() ? `<button class="btn btn-sm" style="background:var(--danger-light);color:var(--danger);" onclick="deleteAsset(${a.asset_id})">Retire</button>` : ''}
                             </div>
                         </td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function renderReturnedAssetTable(assets) {
+    return `
+        <table>
+            <thead>
+                <tr>
+                    <th>Asset Tag</th>
+                    <th>Asset</th>
+                    <th>Status</th>
+                    <th>Returned</th>
+                    <th>Related Ticket</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${assets.map(a => `
+                    <tr>
+                        <td><span class="ticket-number">${escHtml(a.asset_tag)}</span></td>
+                        <td onclick="openAssetDetails(${a.asset_id})" style="cursor:pointer;">
+                            <span class="ticket-link">${escHtml(a.asset_name)}</span>
+                            <div style="color:var(--text-muted);font-size:12px;">${escHtml([a.brand, a.model].filter(Boolean).join(' ') || a.serial_number || '')}</div>
+                        </td>
+                        <td>${assetStatusBadge(a.return_status || a.status || 'Returned')}</td>
+                        <td style="color:var(--text-muted);font-size:12px;">${formatDate(a.returned_at)}</td>
+                        <td>
+                            ${a.related_ticket_id ? `<span class="ticket-link" onclick="openTicket(${a.related_ticket_id})">${escHtml(a.related_ticket_number || 'View Ticket')}</span>` : '<span style="color:var(--text-muted);">-</span>'}
+                        </td>
+                        <td><button class="btn btn-secondary btn-sm" onclick="openAssetDetails(${a.asset_id})">View</button></td>
                     </tr>
                 `).join('')}
             </tbody>
@@ -1691,6 +1768,7 @@ async function editAssetPage(assetId) {
 }
 
 function renderAssetForm(asset, meta, isEdit) {
+    selectedAssetFiles = [];
     document.getElementById('page-content').innerHTML = `
         <div style="max-width:820px;">
             <div class="card">
@@ -1742,9 +1820,9 @@ function renderAssetForm(asset, meta, isEdit) {
                             </div>
                             <div class="form-group">
                                 <label class="form-label">Assigned User</label>
-                                <select class="form-select" id="asset-assigned-to">
+                                <select class="form-select" id="asset-assigned-to" onchange="applyAssignedUserMeta()">
                                     <option value="">Unassigned</option>
-                                    ${meta.users.map(u => `<option value="${u.user_id}" ${String(asset.assigned_to || '') === String(u.user_id) ? 'selected' : ''}>${escHtml(u.full_name)}${u.department ? ' - ' + escHtml(u.department) : ''}</option>`).join('')}
+                                    ${meta.users.map(u => `<option value="${u.user_id}" data-department="${escHtml(u.department || '')}" data-role="${escHtml(u.role_name || '')}" data-location="${escHtml(u.branch || '')}" ${String(asset.assigned_to || '') === String(u.user_id) ? 'selected' : ''}>${escHtml(u.full_name)}${u.department ? ' - ' + escHtml(u.department) : ''}</option>`).join('')}
                                 </select>
                             </div>
                         </div>
@@ -1761,6 +1839,22 @@ function renderAssetForm(asset, meta, isEdit) {
                                 <input class="form-input" id="asset-location" value="${escHtml(asset.location || '')}" placeholder="HQ - 3rd Floor">
                             </div>
                         </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label class="form-label">Role</label>
+                                <input class="form-input" id="asset-user-role" value="" disabled style="opacity:0.75;">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Upload Files</label>
+                                <div class="upload-area" id="asset-upload-area" onclick="document.getElementById('asset-file-input').click()" ondragover="handleAssetDragOver(event)" ondrop="handleAssetDrop(event)" style="padding:16px;">
+                                    <div class="upload-icon">File</div>
+                                    <p>Click to upload or <strong>drag and drop</strong></p>
+                                    <p style="font-size:11px;color:var(--text-muted);margin-top:4px;">Max 10MB per file. JPG, PNG, PDF, DOC, XLS, ZIP</p>
+                                </div>
+                                <input type="file" id="asset-file-input" multiple accept=".jpg,.jpeg,.png,.gif,.pdf,.doc,.docx,.xls,.xlsx,.txt,.zip" class="hidden" onchange="handleAssetFileSelect(event)">
+                            </div>
+                        </div>
+                        <div class="file-list" id="asset-file-list" style="margin-bottom:16px;"></div>
                         <div class="form-row">
                             <div class="form-group">
                                 <label class="form-label">Purchase Date</label>
@@ -1789,6 +1883,64 @@ function renderAssetForm(asset, meta, isEdit) {
         </div>
     `;
     document.getElementById('asset-form').addEventListener('submit', e => submitAssetForm(e, asset.asset_id));
+    applyAssignedUserMeta();
+}
+
+function applyAssignedUserMeta() {
+    const selected = document.getElementById('asset-assigned-to')?.selectedOptions?.[0];
+    if (!selected || !selected.value) {
+        const roleEl = document.getElementById('asset-user-role');
+        if (roleEl) roleEl.value = '';
+        return;
+    }
+
+    const department = selected.dataset.department || '';
+    const role = selected.dataset.role || '';
+    const location = selected.dataset.location || '';
+    const departmentEl = document.getElementById('asset-form-department');
+    const roleEl = document.getElementById('asset-user-role');
+    const locationEl = document.getElementById('asset-location');
+
+    if (departmentEl && department) departmentEl.value = department;
+    if (roleEl) roleEl.value = role;
+    if (locationEl && location) locationEl.value = location;
+}
+
+function handleAssetFileSelect(e) {
+    const newFiles = Array.from(e.target.files);
+    selectedAssetFiles = [...selectedAssetFiles, ...newFiles].slice(0, 5);
+    renderAssetFileList();
+}
+
+function handleAssetDragOver(e) {
+    e.preventDefault();
+    document.getElementById('asset-upload-area')?.classList.add('drag-over');
+}
+
+function handleAssetDrop(e) {
+    e.preventDefault();
+    document.getElementById('asset-upload-area')?.classList.remove('drag-over');
+    const newFiles = Array.from(e.dataTransfer.files);
+    selectedAssetFiles = [...selectedAssetFiles, ...newFiles].slice(0, 5);
+    renderAssetFileList();
+}
+
+function removeAssetFile(idx) {
+    selectedAssetFiles.splice(idx, 1);
+    renderAssetFileList();
+}
+
+function renderAssetFileList() {
+    const list = document.getElementById('asset-file-list');
+    if (!list) return;
+    list.innerHTML = selectedAssetFiles.map((f, i) => `
+        <div class="file-item">
+            <span class="file-icon">${fileIcon(f.type)}</span>
+            <span class="file-name">${escHtml(f.name)}</span>
+            <span class="file-size">${formatFileSize(f.size)}</span>
+            <span class="file-remove" onclick="removeAssetFile(${i})">x</span>
+        </div>
+    `).join('');
 }
 
 async function submitAssetForm(e, assetId = null) {
@@ -1819,11 +1971,22 @@ async function submitAssetForm(e, assetId = null) {
 
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span> Saving...';
-    const data = assetId
-        ? await assetRequest('PATCH', `/${assetId}`, body)
-        : await assetRequest('POST', '/', body);
+    let data;
+    if (selectedAssetFiles.length) {
+        const fd = new FormData();
+        Object.entries(body).forEach(([key, value]) => fd.append(key, value ?? ''));
+        selectedAssetFiles.forEach(file => fd.append('attachments', file));
+        data = assetId
+            ? await assetRequest('PATCH', `/${assetId}`, fd, true)
+            : await assetRequest('POST', '/', fd, true);
+    } else {
+        data = assetId
+            ? await assetRequest('PATCH', `/${assetId}`, body)
+            : await assetRequest('POST', '/', body);
+    }
 
     if (data.success) {
+        selectedAssetFiles = [];
         showToast(assetId ? 'Asset updated!' : 'Asset created!', 'success');
         const id = assetId || data.asset_id || data.asset?.asset_id;
         if (id) openAssetDetails(id);
@@ -1874,6 +2037,9 @@ async function assetDetailsPage(assetId) {
     const maintenance = data.maintenance_logs || data.maintenance || [];
     const tickets = data.tickets || [];
     const activity = data.activity_logs || [];
+    const attachments = data.attachments || [];
+    const isCurrentUserAsset = data.is_currently_assigned_to_user !== false && asset.assigned_to === currentUser.user_id && asset.status === 'Assigned';
+    const returnedContext = getReturnedAssetContext(asset, assignments, tickets);
     document.getElementById('page-content').innerHTML = `
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:10px;flex-wrap:wrap;">
             <button class="btn btn-secondary btn-sm" onclick="navigateTo('assets')">Back</button>
@@ -1883,6 +2049,12 @@ async function assetDetailsPage(assetId) {
                 ${canManageAssets() ? `<button class="btn btn-sm" style="background:var(--danger-light);color:var(--danger);" onclick="deleteAsset(${asset.asset_id})">Retire</button>` : ''}
             </div>
         </div>
+
+        ${!canManageAssets() && !isCurrentUserAsset ? `
+            <div class="alert alert-warning">
+                This asset is no longer currently assigned to your account.
+            </div>
+        ` : ''}
 
         <div class="card" style="margin-bottom:20px;">
             <div class="card-header">
@@ -1900,10 +2072,12 @@ async function assetDetailsPage(assetId) {
                             <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-tickets')">Tickets (${tickets.length})</button>
                             <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-assignments')">Assignments (${assignments.length})</button>
                             <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-maintenance')">Maintenance (${maintenance.length})</button>
+                            <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-files')">Files (${attachments.length})</button>
                             ${canManageAssets() ? `<button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-activity')">Activity (${activity.length})</button>` : ''}
                         </div>
                         <div id="asset-tab-details">
                             <p style="color:var(--text-secondary);font-size:13.5px;line-height:1.7;margin-bottom:20px;">${escHtml(asset.notes || 'No notes recorded for this asset.')}</p>
+                            ${returnedContext ? renderReturnedAssetDetails(returnedContext) : ''}
                             <div class="form-row">
                                 ${assetMetaBlock('Brand', asset.brand)}
                                 ${assetMetaBlock('Model', asset.model)}
@@ -1922,6 +2096,9 @@ async function assetDetailsPage(assetId) {
                         <div id="asset-tab-maintenance" class="hidden">
                             ${renderMaintenanceLogs(maintenance)}
                         </div>
+                        <div id="asset-tab-files" class="hidden">
+                            ${renderAssetAttachments(attachments)}
+                        </div>
                         ${canManageAssets() ? `<div id="asset-tab-activity" class="hidden">${renderAssetActivityLogs(activity)}</div>` : ''}
                     </div>
                     <div>
@@ -1938,13 +2115,77 @@ async function assetDetailsPage(assetId) {
     `;
 }
 
+function getReturnedAssetContext(asset, assignments, tickets) {
+    const returnedAssignment = assignments.find(a => a.returned_at || ['Returned', 'Pulled Out'].includes(a.return_status));
+    const relatedTicket = returnedAssignment?.related_ticket_id
+        ? {
+            ticket_id: returnedAssignment.related_ticket_id,
+            ticket_number: returnedAssignment.related_ticket_number,
+            title: returnedAssignment.related_ticket_title,
+            category_name: returnedAssignment.related_ticket_category,
+            status: returnedAssignment.related_ticket_status,
+            created_at: returnedAssignment.related_ticket_created_at,
+            resolved_at: returnedAssignment.related_ticket_resolved_at,
+            resolution_notes: returnedAssignment.related_ticket_notes
+        }
+        : tickets[0];
+
+    if (!returnedAssignment && !['Returned', 'Pulled Out', 'Retired', 'Lost'].includes(asset.status)) return null;
+    return { assignment: returnedAssignment || {}, ticket: relatedTicket || null };
+}
+
+function renderReturnedAssetDetails(context) {
+    const t = context.ticket;
+    return `
+        <div class="alert alert-warning" style="margin-bottom:16px;">
+            Asset status: ${escHtml(context.assignment.return_status || 'Returned')}. This item is part of your asset history, not your current assigned assets.
+        </div>
+        <div style="border-top:1px solid var(--border);border-bottom:1px solid var(--border);padding:14px 0;margin-bottom:18px;">
+            <div style="font-size:13px;font-weight:700;margin-bottom:10px;">Related Ticket</div>
+            ${t ? `
+                <div class="ticket-detail-grid">
+                    <div>
+                        <div style="margin-bottom:10px;">
+                            <span class="ticket-number">${escHtml(t.ticket_number || '-')}</span>
+                            <div class="ticket-link" style="margin-top:4px;cursor:pointer;" onclick="openTicket(${t.ticket_id})">${escHtml(t.title || '-')}</div>
+                        </div>
+                        <p style="color:var(--text-secondary);font-size:13px;line-height:1.6;">${escHtml(t.resolution_notes || context.assignment.return_notes || context.assignment.return_condition || 'No notes recorded.')}</p>
+                    </div>
+                    <div>
+                        ${assetSideMeta('Category', t.category_name)}
+                        ${assetSideMeta('Status', t.status)}
+                        ${assetSideMeta('Created', formatDate(t.created_at))}
+                        ${assetSideMeta('Resolved', formatDate(t.resolved_at))}
+                    </div>
+                </div>
+            ` : '<div class="empty-state"><div class="empty-icon">A</div><h3>No related ticket recorded</h3></div>'}
+        </div>
+    `;
+}
+
 function switchAssetDetailTab(activeId) {
-    ['asset-tab-details','asset-tab-tickets','asset-tab-assignments','asset-tab-maintenance','asset-tab-activity'].forEach(id => {
+    ['asset-tab-details','asset-tab-tickets','asset-tab-assignments','asset-tab-maintenance','asset-tab-files','asset-tab-activity'].forEach(id => {
         document.getElementById(id)?.classList.toggle('hidden', id !== activeId);
     });
     document.querySelectorAll('#page-content .tabs .tab-btn').forEach(btn => {
         btn.classList.toggle('active', btn.getAttribute('onclick').includes(activeId));
     });
+}
+
+function renderAssetAttachments(attachments) {
+    if (!attachments.length) return '<div class="empty-state"><div class="empty-icon">A</div><h3>No files uploaded</h3></div>';
+    return `
+        <div style="display:flex;flex-direction:column;gap:8px;">
+            ${attachments.map(a => `
+                <div class="file-item">
+                    <span class="file-icon">${fileIcon(a.file_type)}</span>
+                    <span class="file-name">${escHtml(a.original_name || a.file_name)}</span>
+                    <span class="file-size">${formatFileSize(a.file_size)}</span>
+                    <a class="btn btn-secondary btn-sm" href="/api/assets/attachments/${a.attachment_id}/download" style="text-decoration:none;">Download</a>
+                </div>
+            `).join('')}
+        </div>
+    `;
 }
 
 function renderAssetTicketHistory(tickets) {
@@ -2042,6 +2283,7 @@ function renderAssetActivityLogs(logs) {
                     <div style="width:6px;height:6px;background:var(--accent);border-radius:50%;margin-top:6px;flex-shrink:0;"></div>
                     <div>
                         <div style="font-size:13px;"><strong>${escHtml(l.changed_by_name || 'System')}</strong> - ${escHtml(l.action)}</div>
+                        ${l.related_ticket_number ? `<div style="font-size:12px;color:var(--text-secondary);">Ticket: ${escHtml(l.related_ticket_number)}</div>` : ''}
                         <div style="font-size:12px;color:var(--text-muted);">${escHtml(l.old_value || '-')} -> ${escHtml(l.new_value || '-')}</div>
                         <div style="font-size:11px;color:var(--text-muted);">${formatDate(l.created_at)}</div>
                     </div>
@@ -2170,6 +2412,8 @@ function assetStatusBadge(status) {
         Available: 'resolved',
         Assigned: 'normal',
         'Under Repair': 'pending',
+        Returned: 'closed',
+        'Pulled Out': 'urgent',
         Retired: 'closed',
         Lost: 'urgent'
     };
