@@ -46,7 +46,7 @@ BEGIN
         model NVARCHAR(100),
         serial_number NVARCHAR(100),
         status NVARCHAR(30) NOT NULL DEFAULT 'Available'
-            CHECK (status IN ('Available', 'Assigned', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost')),
+            CHECK (status IN ('Available', 'Assigned', 'For Inspection', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost')),
         assigned_to INT,
         department NVARCHAR(100),
         location NVARCHAR(150),
@@ -67,7 +67,7 @@ BEGIN
 END
 GO
 
--- Extend existing asset status check constraints to include Returned and Pulled Out.
+-- Extend existing asset status check constraints to include return workflow statuses.
 DECLARE @AssetStatusConstraint NVARCHAR(128);
 SELECT TOP 1 @AssetStatusConstraint = cc.name
 FROM sys.check_constraints cc
@@ -86,11 +86,11 @@ IF NOT EXISTS (
     SELECT 1
     FROM sys.check_constraints cc
     JOIN sys.tables t ON cc.parent_object_id = t.object_id
-    WHERE t.name = 'assets' AND cc.definition LIKE '%Pulled Out%'
+    WHERE t.name = 'assets' AND cc.definition LIKE '%For Inspection%'
 )
 BEGIN
     ALTER TABLE assets ADD CONSTRAINT CK_assets_status
-    CHECK (status IN ('Available', 'Assigned', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'));
+    CHECK (status IN ('Available', 'Assigned', 'For Inspection', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'));
 END
 GO
 

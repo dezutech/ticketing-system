@@ -6,6 +6,11 @@ const path = require('path');
 const fs = require('fs');
 const { query, sql } = require('../config/database');
 const { authenticateToken, requirePermission } = require('../middleware/auth');
+const { logActivity } = require('../utils/activityLogger');
+const { notifyUsers, getAdminNotificationRecipients } = require('../utils/notificationService');
+
+const TICKET_PRIORITIES = ['Urgent', 'High', 'Normal', 'Low'];
+const TICKET_STATUSES = ['Open', 'In Progress', 'Pending', 'Resolved', 'Closed'];
 
 // Multer config
 const storage = multer.diskStorage({
@@ -53,6 +58,20 @@ function nullableString(value) {
 
 function nullableInt(value) {
     return value === undefined || value === null || value === '' ? null : Number(value);
+}
+
+function parsePositiveInt(value, fallback, max = null) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isInteger(parsed) || parsed < 1) return fallback;
+    return max ? Math.min(parsed, max) : parsed;
+}
+
+function ticketLink(ticketId) {
+    return `ticket:${ticketId}`;
+}
+
+function ticketNotificationOptions(type, ticketId, title) {
+    return { title, type, relatedTicketId: Number(ticketId) };
 }
 
 async function linkTicketAsset(ticketId, assetId, user) {
@@ -137,13 +156,18 @@ async function linkTicketAsset(ticketId, assetId, user) {
 // GET /api/tickets — list tickets
 router.get('/', authenticateToken, async (req, res) => {
     try {
-        const { status, priority, assigned, search, page = 1, limit = 20 } = req.query;
+        const { status, priority, assigned, search, created_by, mine } = req.query;
+        const page = parsePositiveInt(req.query.page, 1);
+        const limit = parsePositiveInt(req.query.limit, 20, 100);
         const offset = (page - 1) * limit;
         let conditions = [];
         let inputs = {};
 
-        if (!req.user.can_view_all_tickets) {
+        if (mine === '1' || mine === 'true') {
             conditions.push('(t.created_by = @userId OR t.assigned_to = @userId)');
+            inputs.userId = { type: sql.Int, value: req.user.user_id };
+        } else if (!req.user.can_view_all_tickets) {
+            conditions.push(req.user.can_assign_tickets ? '(t.created_by = @userId OR t.assigned_to = @userId)' : 't.created_by = @userId');
             inputs.userId = { type: sql.Int, value: req.user.user_id };
         }
         if (status) {
@@ -158,6 +182,17 @@ router.get('/', authenticateToken, async (req, res) => {
             conditions.push('t.assigned_to IS NULL');
         } else if (assigned === 'assigned') {
             conditions.push('t.assigned_to IS NOT NULL');
+        }
+        if (created_by !== undefined) {
+            const createdBy = nullableInt(created_by);
+            if (createdBy === null || !Number.isInteger(createdBy)) {
+                return res.status(400).json({ success: false, message: 'Invalid created by user.' });
+            }
+            if (!req.user.can_view_all_tickets && createdBy !== req.user.user_id) {
+                return res.status(403).json({ success: false, message: 'Insufficient permissions.' });
+            }
+            conditions.push('t.created_by = @createdBy');
+            inputs.createdBy = { type: sql.Int, value: createdBy };
         }
         if (search) {
             conditions.push('(t.title LIKE @search OR t.ticket_number LIKE @search)');
@@ -199,7 +234,13 @@ router.get('/', authenticateToken, async (req, res) => {
 // GET /api/tickets/stats — dashboard stats
 router.get('/stats', authenticateToken, async (req, res) => {
     try {
-        let userFilter = req.user.can_view_all_tickets ? '' : `AND (created_by = ${req.user.user_id} OR assigned_to = ${req.user.user_id})`;
+        let userFilter = '';
+        if (!req.user.can_view_all_tickets) {
+            userFilter = req.user.can_assign_tickets
+                ? 'AND (created_by = @userId OR assigned_to = @userId)'
+                : 'AND created_by = @userId';
+        }
+        const inputs = req.user.can_view_all_tickets ? {} : { userId: { type: sql.Int, value: req.user.user_id } };
         
         const result = await query(`
             SELECT 
@@ -212,7 +253,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
                 SUM(CASE WHEN priority = 'Urgent' AND status NOT IN ('Resolved','Closed') THEN 1 ELSE 0 END) as urgent_open,
                 SUM(CASE WHEN assigned_to IS NULL AND status NOT IN ('Resolved','Closed') THEN 1 ELSE 0 END) as unassigned_count
             FROM Tickets WHERE 1=1 ${userFilter}
-        `);
+        `, inputs);
         res.json({ success: true, stats: result.recordset[0] });
     } catch (err) {
         console.error(err);
@@ -306,6 +347,9 @@ router.post('/', authenticateToken, upload.array('attachments', 5), async (req, 
     try {
         const { title, description, category_id, priority, department, due_date, asset_id } = req.body;
         if (!title || !description) return res.status(400).json({ success: false, message: 'Title and description required.' });
+        if (priority && !TICKET_PRIORITIES.includes(priority)) {
+            return res.status(400).json({ success: false, message: 'Invalid ticket priority.' });
+        }
 
         const ticketNumber = await generateTicketNumber();
 
@@ -354,6 +398,21 @@ router.post('/', authenticateToken, upload.array('attachments', 5), async (req, 
             VALUES (@tid, @uid, 'status', NULL, 'Open')
         `, { tid: { type: sql.Int, value: ticketId }, uid: { type: sql.Int, value: req.user.user_id } });
 
+        await logActivity(req.user, 'Ticket created', 'Tickets', ticketId, {
+            ticket_number: ticketNumber,
+            title,
+            priority: priority || 'Normal'
+        });
+
+        const adminRecipients = await getAdminNotificationRecipients([req.user.user_id]);
+        await notifyUsers(
+            adminRecipients,
+            `New unassigned ticket created: ${ticketNumber} - ${title}`,
+            'Tickets',
+            ticketId,
+            ticketLink(ticketId),
+            ticketNotificationOptions('ticket_unassigned', ticketId, 'New unassigned ticket')
+        );
         res.json({ success: true, message: 'Ticket created.', ticket_id: ticketId, ticket_number: ticketNumber });
     } catch (err) {
         if (err.message?.toLowerCase().includes('asset')) {
@@ -369,6 +428,13 @@ router.patch('/:id', authenticateToken, async (req, res) => {
     try {
         const { status, assigned_to, resolution_notes, priority, due_date, asset_id } = req.body;
         const ticketId = req.params.id;
+
+        if (status && !TICKET_STATUSES.includes(status)) {
+            return res.status(400).json({ success: false, message: 'Invalid ticket status.' });
+        }
+        if (priority && !TICKET_PRIORITIES.includes(priority)) {
+            return res.status(400).json({ success: false, message: 'Invalid ticket priority.' });
+        }
 
         const existing = await query(`SELECT * FROM Tickets WHERE ticket_id = @id`, { id: { type: sql.Int, value: ticketId } });
         if (!existing.recordset.length) return res.status(404).json({ success: false, message: 'Ticket not found.' });
@@ -387,6 +453,19 @@ router.patch('/:id', authenticateToken, async (req, res) => {
             if (status === 'Resolved') { updates.push('resolved_at = GETDATE()'); }
             await query(`INSERT INTO TicketHistory (ticket_id, changed_by, field_changed, old_value, new_value) VALUES (@id, @uid, 'status', @old, @new)`,
                 { id: { type: sql.Int, value: ticketId }, uid: { type: sql.Int, value: req.user.user_id }, old: { type: sql.NVarChar, value: ticket.status }, new: { type: sql.NVarChar, value: status } });
+            await logActivity(req.user, 'Ticket status changed', 'Tickets', ticketId, {
+                from: ticket.status,
+                to: status
+            });
+            const adminRecipients = await getAdminNotificationRecipients([req.user.user_id]);
+            await notifyUsers(
+                [ticket.created_by, ticket.assigned_to, ...adminRecipients],
+                `Ticket ${ticket.ticket_number} status changed from ${ticket.status} to ${status}`,
+                'Tickets',
+                ticketId,
+                ticketLink(ticketId),
+                ticketNotificationOptions(['Resolved', 'Closed'].includes(status) ? 'ticket_closed' : 'ticket_status', ticketId, 'Ticket status changed')
+            );
         }
         if (assigned_to !== undefined && req.user.can_assign_tickets) {
             const assignedTo = nullableInt(assigned_to);
@@ -398,6 +477,41 @@ router.patch('/:id', authenticateToken, async (req, res) => {
             inputs.assignedTo = { type: sql.Int, value: assignedTo };
             await query(`INSERT INTO TicketHistory (ticket_id, changed_by, field_changed, old_value, new_value) VALUES (@id, @uid, 'assigned_to', @old, @new)`,
                 { id: { type: sql.Int, value: ticketId }, uid: { type: sql.Int, value: req.user.user_id }, old: { type: sql.NVarChar, value: nullableString(ticket.assigned_to) }, new: { type: sql.NVarChar, value: nullableString(assignedTo) } });
+            await logActivity(req.user, 'Ticket assigned', 'Tickets', ticketId, {
+                from: ticket.assigned_to,
+                to: assignedTo
+            });
+            const adminRecipients = await getAdminNotificationRecipients([req.user.user_id]);
+            if (assignedTo && String(assignedTo) !== String(ticket.assigned_to || '')) {
+                await notifyUsers(
+                    [assignedTo],
+                    `You have been assigned ${ticket.ticket_number} - ${ticket.title}`,
+                    'Tickets',
+                    ticketId,
+                    ticketLink(ticketId),
+                    ticketNotificationOptions('ticket_assigned', ticketId, 'Ticket assigned to you')
+                );
+            }
+            if (ticket.assigned_to && String(ticket.assigned_to) !== String(assignedTo || '')) {
+                await notifyUsers(
+                    [ticket.assigned_to],
+                    `${ticket.ticket_number} - ${ticket.title} was reassigned away from you`,
+                    'Tickets',
+                    ticketId,
+                    ticketLink(ticketId),
+                    ticketNotificationOptions('ticket_reassigned_away', ticketId, 'Ticket reassigned')
+                );
+            }
+            await notifyUsers(
+                adminRecipients,
+                assignedTo
+                    ? `${ticket.ticket_number} - ${ticket.title} was assigned`
+                    : `${ticket.ticket_number} - ${ticket.title} was unassigned`,
+                'Tickets',
+                ticketId,
+                ticketLink(ticketId),
+                ticketNotificationOptions('ticket_assignment_update', ticketId, 'Ticket assignment updated')
+            );
         }
         if (resolution_notes) { updates.push('resolution_notes = @notes'); inputs.notes = { type: sql.NVarChar, value: resolution_notes }; }
         if (priority) { updates.push('priority = @priority'); inputs.priority = { type: sql.NVarChar, value: priority }; }
@@ -411,8 +525,12 @@ router.patch('/:id', authenticateToken, async (req, res) => {
         if (updates.length) {
             updates.push('updated_at = GETDATE()');
             await query(`UPDATE Tickets SET ${updates.join(', ')} WHERE ticket_id = @id`, inputs);
+            await logActivity(req.user, 'Ticket updated', 'Tickets', ticketId, {
+                fields: updates.filter(field => field !== 'updated_at = GETDATE()').map(field => field.split('=')[0].trim())
+            });
         } else {
             await query(`UPDATE Tickets SET updated_at = GETDATE() WHERE ticket_id = @id`, inputs);
+            await logActivity(req.user, 'Ticket updated', 'Tickets', ticketId, { fields: ['asset'] });
         }
 
         res.json({ success: true, message: 'Ticket updated.' });

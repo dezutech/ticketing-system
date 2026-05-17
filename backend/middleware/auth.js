@@ -2,6 +2,13 @@
 const jwt = require('jsonwebtoken');
 const { query, sql } = require('../config/database');
 
+async function ensureUserThemeColumn() {
+    await query(`
+        IF COL_LENGTH('Users', 'theme_preference') IS NULL
+            ALTER TABLE Users ADD theme_preference NVARCHAR(20) NOT NULL CONSTRAINT DF_Users_theme_preference DEFAULT 'modern'
+    `);
+}
+
 async function authenticateToken(req, res, next) {
     const token = req.cookies?.token || req.headers['authorization']?.split(' ')[1];
     
@@ -11,9 +18,10 @@ async function authenticateToken(req, res, next) {
 
     try {
         const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        await ensureUserThemeColumn();
         const result = await query(`
             SELECT u.user_id, u.username, u.email, u.full_name, u.department, u.role_id,
-                   u.must_change_password, r.role_name, r.can_assign_tickets,
+                   u.must_change_password, u.theme_preference, r.role_name, r.can_assign_tickets,
                    r.can_manage_users, r.can_view_all_tickets, r.can_manage_roles
             FROM Users u
             JOIN Roles r ON u.role_id = r.role_id
@@ -39,7 +47,8 @@ async function authenticateToken(req, res, next) {
             can_manage_users: !!freshUser.can_manage_users,
             can_view_all_tickets: !!freshUser.can_view_all_tickets,
             can_manage_roles: !!freshUser.can_manage_roles,
-            must_change_password: !!freshUser.must_change_password
+            must_change_password: !!freshUser.must_change_password,
+            theme_preference: freshUser.theme_preference || 'modern'
         };
         next();
     } catch (err) {
@@ -68,4 +77,4 @@ function requirePermission(permission) {
     };
 }
 
-module.exports = { authenticateToken, requireRole, requirePermission };
+module.exports = { authenticateToken, requireRole, requirePermission, ensureUserThemeColumn };

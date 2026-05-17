@@ -67,6 +67,7 @@
                 </div>
             </div>
             <div id="user-menu" class="hidden" style="margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;">
+                <button onclick="openProfileSettings()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--text-primary);cursor:pointer;font-family:inherit;">⚙ Profile Settings</button>
                 <button onclick="openChangePassword()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--text-primary);cursor:pointer;font-family:inherit;">🔑 Change Password</button>
                 <button onclick="toggleTheme()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--text-primary);cursor:pointer;font-family:inherit;" id="theme-toggle-sidebar">🌙 Dark Mode</button>
                 <hr style="margin:0;border-color:var(--border);">
@@ -83,6 +84,21 @@
                 <span class="topbar-title" id="page-title">Dashboard</span>
             </div>
             <div class="topbar-actions">
+                <div class="notification-wrap hidden">
+                    <button class="btn-icon notification-btn" id="notification-toggle-old" data-tip="Notifications">
+                        🔔
+                        <span class="notification-count hidden" id="notification-count-old">0</span>
+                    </button>
+                    <div class="notification-panel hidden" id="notification-panel-old">
+                        <div class="notification-header">
+                            <strong>Notifications</strong>
+                            <button onclick="markAllNotificationsRead()">Mark all read</button>
+                        </div>
+                        <div id="notification-list-old" class="notification-list">
+                            <div class="empty-state" style="padding:20px;"><p>Loading...</p></div>
+                        </div>
+                    </div>
+                </div>
                 <button class="btn-icon" onclick="toggleTheme()" id="theme-toggle" data-tip="Toggle theme">🌙</button>
                 <button class="btn btn-primary btn-sm" onclick="navigateTo('create-ticket')">➕ New Ticket</button>
             </div>
@@ -95,6 +111,21 @@
                 <p>Loading...</p>
             </div>
         </main>
+        <div class="notification-wrap floating-notification" id="floating-notification">
+            <button class="notification-float-btn" onclick="toggleNotifications()" id="notification-toggle-float" aria-label="Notifications">
+                <span class="notification-bell">&#128276;</span>
+                <span class="notification-count hidden" id="notification-count">0</span>
+            </button>
+            <div class="notification-panel hidden" id="notification-panel">
+                <div class="notification-header">
+                    <strong>Notifications</strong>
+                    <button onclick="markAllNotificationsRead()">Mark all read</button>
+                </div>
+                <div id="notification-list" class="notification-list">
+                    <div class="empty-state" style="padding:20px;"><p>Loading...</p></div>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 

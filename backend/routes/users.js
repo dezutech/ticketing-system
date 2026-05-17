@@ -4,6 +4,7 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const { query, sql } = require('../config/database');
 const { authenticateToken, requirePermission } = require('../middleware/auth');
+const { logActivity } = require('../utils/activityLogger');
 
 // GET /api/users
 router.get('/', authenticateToken, requirePermission('can_manage_users'), async (req, res) => {
@@ -66,8 +67,9 @@ router.post('/', authenticateToken, requirePermission('can_manage_users'), async
         }
 
         const hash = await bcrypt.hash(password, 10);
-        await query(`
+        const created = await query(`
             INSERT INTO Users (username, email, password_hash, full_name, role_id, department, phone, position, branch)
+            OUTPUT INSERTED.user_id
             VALUES (@username, @email, @hash, @name, @role, @dept, @phone, @position, @branch)
         `, {
             username: { type: sql.NVarChar, value: username },
@@ -81,6 +83,12 @@ router.post('/', authenticateToken, requirePermission('can_manage_users'), async
             branch: { type: sql.NVarChar, value: branch || null },
         });
 
+        await logActivity(req.user, 'User created', 'Users', created.recordset[0].user_id, {
+            username,
+            email,
+            full_name,
+            role_id
+        });
         res.json({ success: true, message: 'User created successfully.' });
     } catch (err) {
         if (err.message?.includes('UNIQUE')) return res.status(400).json({ success: false, message: 'Username or email already exists.' });
@@ -138,6 +146,9 @@ router.patch('/:id', authenticateToken, requirePermission('can_manage_users'), a
         updates.push('updated_at = GETDATE()');
 
         await query(`UPDATE Users SET ${updates.join(', ')} WHERE user_id = @id`, inputs);
+        await logActivity(req.user, 'User updated', 'Users', req.params.id, {
+            fields: updates.filter(field => field !== 'updated_at = GETDATE()').map(field => field.split('=')[0].trim())
+        });
         res.json({ success: true, message: 'User updated.' });
     } catch (err) {
         console.error(err);
@@ -152,6 +163,7 @@ router.delete('/:id', authenticateToken, requirePermission('can_manage_users'), 
             return res.status(400).json({ success: false, message: 'Cannot deactivate your own account.' });
         }
         await query(`UPDATE Users SET is_active = 0 WHERE user_id = @id`, { id: { type: sql.Int, value: req.params.id } });
+        await logActivity(req.user, 'User deactivated', 'Users', req.params.id);
         res.json({ success: true, message: 'User deactivated.' });
     } catch (err) {
         res.status(500).json({ success: false, message: 'Server error.' });
@@ -160,7 +172,7 @@ router.delete('/:id', authenticateToken, requirePermission('can_manage_users'), 
 
 // ============ ROLES ============
 
-router.get('/roles', authenticateToken, async (req, res) => {
+router.get('/roles', authenticateToken, requirePermission('can_manage_users'), async (req, res) => {
     try {
         const result = await query(`SELECT * FROM Roles WHERE is_active = 1 ORDER BY role_id`);
         res.json({ success: true, roles: result.recordset });

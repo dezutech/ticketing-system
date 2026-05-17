@@ -20,10 +20,17 @@ const API = {
 // ─── STATE ───
 let currentUser = null;
 let currentPage = 'dashboard';
+let currentActivityLogFilters = {};
+let currentTicketFilters = {};
+let notificationPollTimer = null;
+let lastUnreadNotificationCount = 0;
+let lastSeenNotificationId = 0;
+let lastNotificationSoundAt = 0;
 
 // ─── INIT ───
 document.addEventListener('DOMContentLoaded', async () => {
-    applyTheme(localStorage.getItem('theme') || 'light');
+    applyTheme(localStorage.getItem('color-theme') || localStorage.getItem('theme') || 'light');
+    applyUiTheme(localStorage.getItem('ui-theme') || 'modern');
     await checkAuth();
 });
 
@@ -31,6 +38,7 @@ async function checkAuth() {
     const data = await API.get('/auth/me');
     if (data.success) {
         currentUser = data.user;
+        applyUiTheme(currentUser.theme_preference || localStorage.getItem('ui-theme') || 'modern');
         showApp();
     } else {
         showLogin();
@@ -40,14 +48,26 @@ async function checkAuth() {
 // ─── THEME ───
 function applyTheme(theme) {
     document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('theme', theme);
+    localStorage.setItem('color-theme', theme);
     const btn = document.getElementById('theme-toggle');
     if (btn) btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+    const sidebarBtn = document.getElementById('theme-toggle-sidebar');
+    if (sidebarBtn) sidebarBtn.textContent = theme === 'dark' ? '☀️ Light Mode' : '🌙 Dark Mode';
 }
 
 function toggleTheme() {
     const current = document.documentElement.getAttribute('data-theme') || 'light';
     applyTheme(current === 'dark' ? 'light' : 'dark');
+}
+
+function normalizeUiTheme(theme) {
+    return ['modern', 'classic', 'luna'].includes(theme) ? theme : 'modern';
+}
+
+function applyUiTheme(theme) {
+    const normalized = normalizeUiTheme(theme);
+    document.documentElement.setAttribute('data-ui-theme', normalized);
+    localStorage.setItem('ui-theme', normalized);
 }
 
 // ─── AUTH ───
@@ -62,6 +82,7 @@ function showApp() {
     document.getElementById('app-layout').classList.remove('hidden');
     renderUserInfo();
     setupNav();
+    startNotificationPolling();
     navigateTo('dashboard');
 }
 
@@ -87,6 +108,7 @@ async function handleLogin(e) {
         const data = await API.post('/auth/login', { username, password });
         if (data.success) {
             currentUser = data.user;
+            applyUiTheme(currentUser.theme_preference || 'modern');
             showApp();
         } else {
             err.textContent = data.message;
@@ -103,23 +125,155 @@ async function handleLogin(e) {
 async function handleLogout() {
     await API.post('/auth/logout');
     currentUser = null;
+    stopNotificationPolling();
+    document.getElementById('notification-count')?.classList.add('hidden');
+    document.getElementById('notification-panel')?.classList.add('hidden');
     showLogin();
 }
+
+async function loadNotifications() {
+    if (!currentUser) return;
+    const data = await API.get('/notifications?limit=20');
+    if (!data.success) return;
+    const notifications = data.notifications || [];
+    const newestId = notifications[0]?.notification_id || 0;
+    const unreadCount = data.unread_count || 0;
+    if (lastSeenNotificationId && newestId > lastSeenNotificationId && unreadCount > lastUnreadNotificationCount) {
+        ringNotificationBell();
+        playNotificationSound();
+        if (notifications.some(n => n.notification_id > lastSeenNotificationId && n.related_ticket_id)) {
+            refreshActiveTicketList();
+        }
+    }
+    lastSeenNotificationId = Math.max(lastSeenNotificationId, newestId);
+    lastUnreadNotificationCount = unreadCount;
+    renderNotificationCount(unreadCount);
+    renderNotificationList(notifications);
+}
+
+function startNotificationPolling() {
+    stopNotificationPolling();
+    loadNotifications();
+    notificationPollTimer = setInterval(loadNotifications, 20000);
+}
+
+function stopNotificationPolling() {
+    if (notificationPollTimer) clearInterval(notificationPollTimer);
+    notificationPollTimer = null;
+    lastUnreadNotificationCount = 0;
+    lastSeenNotificationId = 0;
+}
+
+function renderNotificationCount(count) {
+    const badge = document.getElementById('notification-count');
+    if (!badge) return;
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.classList.toggle('hidden', count <= 0);
+}
+
+function renderNotificationList(notifications) {
+    const list = document.getElementById('notification-list');
+    if (!list) return;
+    if (!notifications.length) {
+        list.innerHTML = '<div class="empty-state" style="padding:20px;"><p>No notifications</p></div>';
+        return;
+    }
+    list.innerHTML = notifications.map(n => `
+        <div class="notification-item ${n.is_read ? '' : 'unread'}" onclick="openNotification(${n.notification_id}, '${escHtml(n.link_target || '')}')">
+            <div class="notification-row">
+                <span class="notification-dot"></span>
+                <div>
+                    <div class="notification-title">${escHtml(n.title || n.message)}</div>
+                    <div class="notification-message">${escHtml(n.message)}</div>
+                    <div class="notification-meta">${n.related_ticket_id ? `Ticket #${escHtml(n.related_ticket_id)}` : escHtml(n.module)} | ${formatDate(n.created_at)}</div>
+                </div>
+            </div>
+        </div>
+    `).join('');
+    return;
+    list.innerHTML = notifications.map(n => `
+        <div class="notification-item ${n.is_read ? '' : 'unread'}" onclick="openNotification(${n.notification_id}, '${escHtml(n.link_target || '')}')">
+            <div class="notification-message">${escHtml(n.message)}</div>
+            <div class="notification-meta">${escHtml(n.module)} • ${formatDate(n.created_at)}</div>
+        </div>
+    `).join('');
+}
+
+async function toggleNotifications() {
+    const panel = document.getElementById('notification-panel');
+    if (!panel) return;
+    panel.classList.toggle('hidden');
+    if (!panel.classList.contains('hidden')) await loadNotifications();
+}
+
+async function openNotification(id, target) {
+    await API.patch(`/notifications/${id}/read`, {});
+    await loadNotifications();
+    document.getElementById('notification-panel')?.classList.add('hidden');
+    if (target.startsWith('ticket:')) openTicket(Number(target.split(':')[1]));
+    if (target.startsWith('asset:')) openAssetDetails(Number(target.split(':')[1]));
+}
+
+async function markAllNotificationsRead() {
+    await API.patch('/notifications/read-all', {});
+    await loadNotifications();
+}
+
+function ringNotificationBell() {
+    const bell = document.getElementById('notification-toggle-float');
+    if (!bell) return;
+    bell.classList.remove('ringing');
+    void bell.offsetWidth;
+    bell.classList.add('ringing');
+}
+
+function playNotificationSound() {
+    const now = Date.now();
+    if (now - lastNotificationSoundAt < 5000) return;
+    lastNotificationSoundAt = now;
+    try {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContext) return;
+        const ctx = new AudioContext();
+        const oscillator = ctx.createOscillator();
+        const gain = ctx.createGain();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(880, ctx.currentTime);
+        oscillator.frequency.exponentialRampToValueAtTime(660, ctx.currentTime + 0.16);
+        gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.22);
+        oscillator.connect(gain);
+        gain.connect(ctx.destination);
+        oscillator.start();
+        oscillator.stop(ctx.currentTime + 0.24);
+    } catch (err) {}
+}
+
+document.addEventListener('click', (event) => {
+    const wrap = document.getElementById('floating-notification');
+    const panel = document.getElementById('notification-panel');
+    if (!wrap || !panel || panel.classList.contains('hidden')) return;
+    if (!wrap.contains(event.target)) panel.classList.add('hidden');
+});
 
 // ─── NAV ───
 function setupNav() {
     const nav = document.getElementById('sidebar-nav');
     const items = [
         { id: 'dashboard', icon: '📊', label: 'Dashboard', always: true },
-        { id: 'tickets', icon: '🎫', label: 'Tickets', always: true },
+        { id: 'tickets', icon: '🎫', label: 'Tickets', anyPerm: ['can_assign_tickets', 'can_view_all_tickets'] },
         { id: 'create-ticket', icon: '➕', label: 'New Ticket', always: true },
         { id: 'my-tickets', icon: '📋', label: 'My Tickets', always: true },
         { id: 'users', icon: '👥', label: 'Users', perm: 'can_manage_users' },
         { id: 'roles', icon: '🔐', label: 'Roles', perm: 'can_manage_roles' },
+        { id: 'reports', icon: 'R', label: 'Reports', anyRole: ['Super Admin', 'Admin'] },
+        { id: 'activity-logs', icon: 'L', label: 'Activity Logs', anyRole: ['Super Admin', 'Admin'] },
+        { id: 'backups', icon: 'B', label: 'Backup & Restore', anyRole: ['Super Admin'] },
     ];
 
     nav.innerHTML = items
-        .filter(i => i.always || currentUser[i.perm])
+        .filter(i => i.always || currentUser[i.perm] || i.anyPerm?.some(perm => currentUser[perm]) || i.anyRole?.includes(currentUser.role_name))
         .map(i => `
             <div class="nav-item" data-page="${i.id}" onclick="navigateTo('${i.id}')">
                 <span class="nav-icon">${i.icon}</span>
@@ -135,6 +289,67 @@ function renderUserInfo() {
     document.getElementById('user-role').textContent = currentUser.role_name;
 }
 
+function openProfileSettings() {
+    document.getElementById('user-menu')?.classList.add('hidden');
+    const selectedTheme = normalizeUiTheme(currentUser?.theme_preference || localStorage.getItem('ui-theme') || 'modern');
+    const html = `
+        <div class="modal-overlay active" id="profile-settings-modal">
+            <div class="modal">
+                <div class="modal-header">
+                    <span class="modal-title">Profile Settings</span>
+                    <button class="modal-close" onclick="closeModal('profile-settings-modal')">×</button>
+                </div>
+                <div class="modal-body">
+                    <div id="profile-settings-alert"></div>
+                    <div class="settings-block">
+                        <div>
+                            <div class="settings-title">Interface Theme</div>
+                            <div class="settings-help">Choose how the whole ticketing system should look after login.</div>
+                        </div>
+                        <select class="form-select" id="ui-theme-select">
+                            <option value="modern" ${selectedTheme === 'modern' ? 'selected' : ''}>Modern</option>
+                            <option value="classic" ${selectedTheme === 'classic' ? 'selected' : ''}>Classic Windows 95/98</option>
+                            <option value="luna" ${selectedTheme === 'luna' ? 'selected' : ''}>Windows XP Luna</option>
+                        </select>
+                    </div>
+                    <div class="theme-preview ${selectedTheme === 'classic' ? 'classic-preview' : ''} ${selectedTheme === 'luna' ? 'luna-preview' : ''}" id="theme-preview">
+                        <div class="theme-preview-title">Preview</div>
+                        <div class="theme-preview-body">
+                            <button class="btn btn-secondary btn-sm" type="button">Button</button>
+                            <input class="form-input" value="${selectedTheme === 'classic' ? 'Classic panel' : selectedTheme === 'luna' ? 'Luna dialog panel' : 'Modern panel'}" readonly>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="closeModal('profile-settings-modal')">Cancel</button>
+                    <button class="btn btn-primary" onclick="saveProfileSettings()">Save Settings</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', html);
+    document.getElementById('ui-theme-select')?.addEventListener('change', e => {
+        const preview = document.getElementById('theme-preview');
+        preview?.classList.toggle('classic-preview', e.target.value === 'classic');
+        preview?.classList.toggle('luna-preview', e.target.value === 'luna');
+    });
+}
+
+async function saveProfileSettings() {
+    const alertEl = document.getElementById('profile-settings-alert');
+    const theme = normalizeUiTheme(document.getElementById('ui-theme-select')?.value);
+    const data = await API.patch('/auth/theme', { theme_preference: theme });
+
+    if (data.success) {
+        currentUser.theme_preference = data.theme_preference;
+        applyUiTheme(data.theme_preference);
+        alertEl.innerHTML = '<div class="alert alert-success">Theme saved.</div>';
+        setTimeout(() => closeModal('profile-settings-modal'), 700);
+    } else {
+        alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to save theme.')}</div>`;
+    }
+}
+
 function navigateTo(page) {
     currentPage = page;
     document.querySelectorAll('.nav-item').forEach(el => {
@@ -146,93 +361,535 @@ function navigateTo(page) {
 
     const titles = {
         dashboard: 'Dashboard', tickets: 'All Tickets', 'create-ticket': 'Create Ticket',
-        'my-tickets': 'My Tickets', users: 'User Management', roles: 'Role Management'
+        'my-tickets': 'My Tickets', users: 'User Management', roles: 'Role Management',
+        reports: 'Reports Export',
+        'activity-logs': 'Activity Logs',
+        backups: 'Backup & Restore'
     };
     document.getElementById('page-title').textContent = titles[page] || page;
 
-    const pages = { dashboard, tickets, 'create-ticket': createTicketPage, 'my-tickets': myTickets, users: usersPage, roles: rolesPage };
+    const pages = { dashboard, tickets, 'create-ticket': createTicketPage, 'my-tickets': myTickets, users: usersPage, roles: rolesPage, reports: reportsPage, 'activity-logs': activityLogsPage, backups: backupsPage };
     if (pages[page]) pages[page]();
 }
 
 // ─── DASHBOARD ───
-async function dashboard() {
-    const [statsData, ticketsData] = await Promise.all([
-        API.get('/tickets/stats'),
-        API.get('/tickets?limit=10')
-    ]);
+// BACKUP & RESTORE
+async function backupsPage() {
+    if (currentUser.role_name !== 'Super Admin') {
+        document.getElementById('page-content').innerHTML = '<div class="alert alert-error">Only Super Admin can access Backup & Restore.</div>';
+        return;
+    }
 
-    const s = statsData.stats || {};
-    const tks = ticketsData.tickets || [];
+    const pageEl = document.getElementById('page-content');
+    pageEl.innerHTML = '<div class="empty-state"><div class="empty-icon">B</div><p>Loading backup history...</p></div>';
 
+    try {
+        const data = await API.get('/backups');
+        if (!data.success) {
+            pageEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to load backups.')}</div>`;
+            return;
+        }
+
+        pageEl.innerHTML = `
+            <div class="backup-layout">
+                <div class="backup-hero card">
+                    <div class="backup-hero-copy">
+                        <span class="backup-kicker">System safety</span>
+                        <h2>Database Backup & Restore</h2>
+                        <p>Create server-stored snapshots of tickets, assets, users, logs, notifications, roles, categories, and settings. Restore is protected by exact filename confirmation.</p>
+                    </div>
+                    <div class="backup-actions">
+                        <button class="btn btn-primary" id="create-backup-btn" onclick="createBackup()">Create Manual Backup</button>
+                    </div>
+                </div>
+                <div id="backup-alert"></div>
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title">Backup History</span>
+                        <span style="font-size:12px;color:var(--text-muted);">${data.backups.length} files</span>
+                    </div>
+                    <div class="table-wrapper">
+                        ${data.backups.length ? renderBackupHistory(data.backups) : `
+                            <div class="empty-state">
+                                <div class="empty-icon">B</div>
+                                <h3>No backups yet</h3>
+                                <p>Create a manual backup to start your restore history.</p>
+                            </div>
+                        `}
+                    </div>
+                </div>
+            </div>
+        `;
+    } catch (err) {
+        pageEl.innerHTML = '<div class="alert alert-error">Unable to load backups. Please try again.</div>';
+    }
+}
+
+function renderBackupHistory(backups) {
+    return `
+        <table>
+            <thead>
+                <tr>
+                    <th>Backup File</th>
+                    <th>Generated</th>
+                    <th>Tables</th>
+                    <th>Rows</th>
+                    <th>Size</th>
+                    <th>Created By</th>
+                    <th>Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${backups.map(backup => `
+                    <tr>
+                        <td>
+                            <strong>${escHtml(backup.file_name)}</strong>
+                            ${backup.invalid ? '<div class="backup-warning">Invalid backup metadata</div>' : ''}
+                        </td>
+                        <td>${formatDate(backup.generated_at || backup.modified_at)}</td>
+                        <td>${backup.table_count ?? '-'}</td>
+                        <td>${backup.row_count ?? '-'}</td>
+                        <td>${formatFileSize(backup.size || 0)}</td>
+                        <td>${escHtml(backup.generated_by?.user_name || '-')}</td>
+                        <td>
+                            <button class="btn btn-secondary btn-sm" ${backup.invalid ? 'disabled' : ''} onclick="openRestoreBackupModal('${escHtml(backup.file_name)}')">Restore</button>
+                        </td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+async function createBackup() {
+    const button = document.getElementById('create-backup-btn');
+    const alertEl = document.getElementById('backup-alert');
+    button.disabled = true;
+    button.textContent = 'Creating backup...';
+    alertEl.innerHTML = '';
+
+    try {
+        const data = await API.post('/backups', {});
+        if (data.success) {
+            showToast('Backup created successfully.', 'success');
+            alertEl.innerHTML = `<div class="alert alert-success">Backup created: ${escHtml(data.backup.file_name)}</div>`;
+            await backupsPage();
+        } else {
+            alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Backup failed.')}</div>`;
+        }
+    } catch (err) {
+        alertEl.innerHTML = '<div class="alert alert-error">Backup failed. Please try again.</div>';
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Create Manual Backup';
+    }
+}
+
+function openRestoreBackupModal(fileName) {
     const html = `
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-icon">🎫</div>
-                <div class="stat-label">Total Tickets</div>
-                <div class="stat-value">${s.total || 0}</div>
-            </div>
-            <div class="stat-card accent">
-                <div class="stat-icon">📂</div>
-                <div class="stat-label">Open</div>
-                <div class="stat-value">${s.open_count || 0}</div>
-            </div>
-            <div class="stat-card warning">
-                <div class="stat-icon">🔄</div>
-                <div class="stat-label">In Progress</div>
-                <div class="stat-value">${s.in_progress_count || 0}</div>
-            </div>
-            <div class="stat-card success">
-                <div class="stat-icon">✅</div>
-                <div class="stat-label">Resolved</div>
-                <div class="stat-value">${s.resolved_count || 0}</div>
-            </div>
-            <div class="stat-card danger">
-                <div class="stat-icon">🚨</div>
-                <div class="stat-label">Urgent Open</div>
-                <div class="stat-value">${s.urgent_open || 0}</div>
-            </div>
-            ${currentUser.can_assign_tickets ? `
-            <div class="stat-card">
-                <div class="stat-icon">⚠️</div>
-                <div class="stat-label">Unassigned</div>
-                <div class="stat-value">${s.unassigned_count || 0}</div>
-            </div>` : ''}
-        </div>
-
-        ${currentUser.can_assign_tickets ? `
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px;">
-            <div class="card" style="cursor:pointer;" onclick="tickets('assigned')">
-                <div class="card-body" style="display:flex;align-items:center;gap:14px;padding:16px 20px;">
-                    <div style="width:42px;height:42px;background:var(--accent-light);border-radius:var(--radius);display:flex;align-items:center;justify-content:center;font-size:20px;">📌</div>
-                    <div>
-                        <div style="font-size:13px;color:var(--text-muted);font-weight:600;">Assigned Tickets</div>
-                        <div style="font-size:22px;font-weight:800;color:var(--accent);">${(s.total || 0) - (s.unassigned_count || 0)}</div>
-                    </div>
+        <div class="modal-overlay active" id="restore-backup-modal">
+            <div class="modal">
+                <div class="modal-header">
+                    <span class="modal-title">Restore Database Backup</span>
+                    <button class="modal-close" onclick="closeModal('restore-backup-modal')">x</button>
                 </div>
-            </div>
-            <div class="card" style="cursor:pointer;" onclick="tickets('unassigned')">
-                <div class="card-body" style="display:flex;align-items:center;gap:14px;padding:16px 20px;">
-                    <div style="width:42px;height:42px;background:var(--warning-light);border-radius:var(--radius);display:flex;align-items:center;justify-content:circle;font-size:20px;align-items:center;justify-content:center;">📭</div>
-                    <div>
-                        <div style="font-size:13px;color:var(--text-muted);font-weight:600;">Unassigned</div>
-                        <div style="font-size:22px;font-weight:800;color:var(--warning);">${s.unassigned_count || 0}</div>
+                <div class="modal-body">
+                    <div class="alert alert-error">
+                        Restore will replace current system data with the selected backup. Create a fresh backup first if you need a rollback point.
                     </div>
+                    <div class="form-group">
+                        <label class="form-label">Selected backup</label>
+                        <input class="form-input" id="restore-file-name" value="${escHtml(fileName)}" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Type the exact backup filename to confirm</label>
+                        <input class="form-input" id="restore-confirmation" placeholder="${escHtml(fileName)}">
+                    </div>
+                    <div id="restore-backup-alert"></div>
                 </div>
-            </div>
-        </div>` : ''}
-
-        <div class="card">
-            <div class="card-header">
-                <span class="card-title">Recent Tickets</span>
-                <button class="btn btn-secondary btn-sm" onclick="navigateTo('tickets')">View All</button>
-            </div>
-            <div class="table-wrapper">
-                ${renderTicketTable(tks)}
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="closeModal('restore-backup-modal')">Cancel</button>
+                    <button class="btn btn-danger" id="restore-backup-btn" onclick="restoreBackup()">Restore Database</button>
+                </div>
             </div>
         </div>
     `;
+    document.body.insertAdjacentHTML('beforeend', html);
+}
 
-    document.getElementById('page-content').innerHTML = html;
+async function restoreBackup() {
+    const fileName = document.getElementById('restore-file-name')?.value;
+    const confirmation = document.getElementById('restore-confirmation')?.value;
+    const alertEl = document.getElementById('restore-backup-alert');
+    const button = document.getElementById('restore-backup-btn');
+
+    if (confirmation !== fileName) {
+        alertEl.innerHTML = '<div class="alert alert-error">Confirmation does not match the backup filename.</div>';
+        return;
+    }
+
+    button.disabled = true;
+    button.textContent = 'Restoring...';
+    try {
+        const data = await API.post('/backups/restore', { file_name: fileName, confirmation });
+        if (data.success) {
+            alertEl.innerHTML = '<div class="alert alert-success">Database restored successfully.</div>';
+            showToast('Database restored successfully.', 'success');
+            setTimeout(() => {
+                closeModal('restore-backup-modal');
+                backupsPage();
+            }, 900);
+        } else {
+            alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Restore failed.')}</div>`;
+        }
+    } catch (err) {
+        alertEl.innerHTML = '<div class="alert alert-error">Restore failed. No changes were committed.</div>';
+    } finally {
+        button.disabled = false;
+        button.textContent = 'Restore Database';
+    }
+}
+
+function canViewDashboardAnalytics() {
+    return ['Super Admin', 'Admin'].includes(currentUser?.role_name);
+}
+
+function dashboardEmptyState(title, message = 'No data available yet.') {
+    return `<div class="empty-state dashboard-empty"><h3>${escHtml(title)}</h3><p>${escHtml(message)}</p></div>`;
+}
+
+function chartColor(label) {
+    const colors = {
+        Open: 'var(--accent)',
+        'In Progress': 'var(--warning)',
+        Pending: 'var(--warning)',
+        Resolved: 'var(--success)',
+        Closed: 'var(--text-muted)',
+        Low: 'var(--text-muted)',
+        Normal: 'var(--accent)',
+        Medium: 'var(--accent)',
+        High: 'var(--warning)',
+        Urgent: 'var(--danger)',
+        Critical: 'var(--danger)',
+        Available: 'var(--success)',
+        Assigned: 'var(--accent)',
+        'For Inspection': 'var(--warning)',
+        Returned: 'var(--text-muted)',
+        'Pulled Out': 'var(--warning)',
+        'Under Repair': 'var(--warning)',
+        Retired: 'var(--text-muted)',
+        Lost: 'var(--danger)'
+    };
+    return colors[label] || 'var(--accent)';
+}
+
+function renderTicketSummaryCards(tickets = {}) {
+    const resolvedClosed = (tickets.resolved || 0) + (tickets.closed || 0);
+    const cards = [
+        { label: 'Total Tickets', value: tickets.total || 0, className: '', icon: 'T' },
+        { label: 'Open', value: tickets.open || 0, className: 'accent', icon: 'O' },
+        { label: 'Pending', value: tickets.pending || 0, className: 'warning', icon: 'P' },
+        { label: 'Resolved / Closed', value: resolvedClosed, className: 'success', icon: 'R' },
+        { label: 'Urgent Open', value: tickets.urgentOpen || 0, className: 'danger', icon: 'U' }
+    ];
+
+    return `
+        <div class="stats-grid dashboard-summary">
+            ${cards.map(card => `
+                <div class="stat-card ${card.className}">
+                    <div class="stat-icon stat-letter">${card.icon}</div>
+                    <div class="stat-label">${card.label}</div>
+                    <div class="stat-value">${card.value}</div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderAssetSummaryCards(assets = {}) {
+    const cards = [
+        { label: 'Total Assets', value: assets.total || 0, className: '', icon: 'A' },
+        { label: 'Available', value: assets.available || 0, className: 'success', icon: 'V' },
+        { label: 'Assigned', value: assets.assigned || 0, className: 'accent', icon: 'S' },
+        { label: 'For Inspection', value: assets.forInspection || 0, className: 'warning', icon: 'I' },
+        { label: 'Returned', value: assets.returned || 0, className: '', icon: 'R' },
+        { label: 'Pulled Out', value: assets.pulledOut || 0, className: 'warning', icon: 'P' }
+    ];
+
+    return `
+        <div class="stats-grid dashboard-summary">
+            ${cards.map(card => `
+                <div class="stat-card ${card.className}">
+                    <div class="stat-icon stat-letter">${card.icon}</div>
+                    <div class="stat-label">${card.label}</div>
+                    <div class="stat-value">${card.value}</div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderHorizontalBars(items, labelKey, valueKey = 'count') {
+    const max = Math.max(...items.map(item => Number(item[valueKey]) || 0), 0);
+    if (!items.length || max === 0) return dashboardEmptyState('No chart data');
+
+    return `
+        <div class="bar-chart">
+            ${items.map(item => {
+                const label = item[labelKey] || 'Unknown';
+                const value = Number(item[valueKey]) || 0;
+                const width = max ? Math.max((value / max) * 100, value ? 4 : 0) : 0;
+                return `
+                    <div class="bar-row">
+                        <div class="bar-label">${escHtml(label)}</div>
+                        <div class="bar-track"><div class="bar-fill" style="width:${width}%;background:${chartColor(label)};"></div></div>
+                        <div class="bar-value">${value}</div>
+                    </div>
+                `;
+            }).join('')}
+        </div>
+    `;
+}
+
+function renderDonutChart(items, labelKey, centerLabel = 'items') {
+    const total = items.reduce((sum, item) => sum + (Number(item.count) || 0), 0);
+    if (!items.length || total === 0) return dashboardEmptyState('No chart data');
+
+    let offset = 0;
+    const radius = 58;
+    const circumference = 2 * Math.PI * radius;
+    const segments = items.map(item => {
+        const value = Number(item.count) || 0;
+        const dash = (value / total) * circumference;
+        const label = item[labelKey] || 'Unknown';
+        const segment = `<circle r="${radius}" cx="80" cy="80" fill="none" stroke="${chartColor(label)}" stroke-width="18" stroke-dasharray="${dash} ${circumference - dash}" stroke-dashoffset="${-offset}" transform="rotate(-90 80 80)" />`;
+        offset += dash;
+        return segment;
+    }).join('');
+
+    return `
+        <div class="donut-chart">
+            <svg viewBox="0 0 160 160" role="img" aria-label="${escHtml(centerLabel)} by status">
+                <circle r="${radius}" cx="80" cy="80" fill="none" stroke="var(--bg-input)" stroke-width="18" />
+                ${segments}
+                <text x="80" y="76" text-anchor="middle" class="donut-total">${total}</text>
+                <text x="80" y="96" text-anchor="middle" class="donut-label">${escHtml(centerLabel)}</text>
+            </svg>
+            <div class="chart-legend">
+                ${items.map(item => {
+                    const label = item[labelKey] || 'Unknown';
+                    return `<span><i style="background:${chartColor(label)}"></i>${escHtml(label)} (${item.count || 0})</span>`;
+                }).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function renderLineChart(items, label = 'Monthly trend') {
+    const values = items.map(item => Number(item.count) || 0);
+    const max = Math.max(...values, 0);
+    if (!items.length || max === 0) return dashboardEmptyState('No monthly data');
+
+    const width = 520;
+    const height = 210;
+    const left = 34;
+    const right = 18;
+    const top = 18;
+    const bottom = 38;
+    const innerWidth = width - left - right;
+    const innerHeight = height - top - bottom;
+    const step = items.length > 1 ? innerWidth / (items.length - 1) : innerWidth;
+    const points = items.map((item, index) => {
+        const x = left + index * step;
+        const y = top + innerHeight - ((Number(item.count) || 0) / max) * innerHeight;
+        return { x, y, label: item.month, count: Number(item.count) || 0 };
+    });
+    const areaPoints = `${left},${top + innerHeight} ${points.map(p => `${p.x},${p.y}`).join(' ')} ${left + innerWidth},${top + innerHeight}`;
+
+    return `
+        <div class="line-chart">
+            <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escHtml(label)}">
+                <polyline points="${areaPoints}" fill="var(--accent-light)" stroke="none"></polyline>
+                <polyline points="${points.map(p => `${p.x},${p.y}`).join(' ')}" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline>
+                ${points.map(p => `<circle cx="${p.x}" cy="${p.y}" r="4" fill="var(--bg-card)" stroke="var(--accent)" stroke-width="3"><title>${escHtml(p.label)}: ${p.count}</title></circle>`).join('')}
+                ${points.map((p, index) => index % Math.ceil(points.length / 6) === 0 || index === points.length - 1 ? `<text x="${p.x}" y="${height - 12}" text-anchor="middle" class="axis-label">${escHtml(p.label)}</text>` : '').join('')}
+            </svg>
+        </div>
+    `;
+}
+
+function renderDualLineChart(primaryItems, secondaryItems) {
+    const months = [...primaryItems, ...secondaryItems]
+        .map(item => `${item.year || ''}-${item.month}`)
+        .filter((value, index, list) => list.indexOf(value) === index);
+    const rows = months.map(key => {
+        const [, month] = key.split('-');
+        const primary = primaryItems.find(item => `${item.year || ''}-${item.month}` === key);
+        const secondary = secondaryItems.find(item => `${item.year || ''}-${item.month}` === key);
+        return {
+            month,
+            assigned: Number(primary?.count) || 0,
+            returned: Number(secondary?.count) || 0
+        };
+    });
+    const max = Math.max(...rows.map(item => Math.max(item.assigned, item.returned)), 0);
+    if (!rows.length || max === 0) return dashboardEmptyState('No assignment trends');
+
+    const width = 520;
+    const height = 210;
+    const left = 34;
+    const right = 18;
+    const top = 18;
+    const bottom = 44;
+    const innerWidth = width - left - right;
+    const innerHeight = height - top - bottom;
+    const step = rows.length > 1 ? innerWidth / (rows.length - 1) : innerWidth;
+    const pointsFor = (key) => rows.map((item, index) => {
+        const x = left + index * step;
+        const y = top + innerHeight - (item[key] / max) * innerHeight;
+        return { x, y, month: item.month, count: item[key] };
+    });
+    const assignedPoints = pointsFor('assigned');
+    const returnedPoints = pointsFor('returned');
+
+    return `
+        <div class="line-chart stacked-line-chart">
+            <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Asset assignments and returns per month">
+                <polyline points="${assignedPoints.map(p => `${p.x},${p.y}`).join(' ')}" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline>
+                <polyline points="${returnedPoints.map(p => `${p.x},${p.y}`).join(' ')}" fill="none" stroke="var(--warning)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline>
+                ${assignedPoints.map(p => `<circle cx="${p.x}" cy="${p.y}" r="4" fill="var(--bg-card)" stroke="var(--accent)" stroke-width="3"><title>${escHtml(p.month)} assigned: ${p.count}</title></circle>`).join('')}
+                ${returnedPoints.map(p => `<circle cx="${p.x}" cy="${p.y}" r="4" fill="var(--bg-card)" stroke="var(--warning)" stroke-width="3"><title>${escHtml(p.month)} returned: ${p.count}</title></circle>`).join('')}
+                ${rows.map((row, index) => index % Math.ceil(rows.length / 6) === 0 || index === rows.length - 1 ? `<text x="${left + index * step}" y="${height - 18}" text-anchor="middle" class="axis-label">${escHtml(row.month)}</text>` : '').join('')}
+            </svg>
+            <div class="chart-legend chart-legend-inline">
+                <span><i style="background:var(--accent)"></i>Assigned</span>
+                <span><i style="background:var(--warning)"></i>Returned</span>
+            </div>
+        </div>
+    `;
+}
+
+function renderRecentAssetList(items, dateKey, emptyTitle) {
+    if (!items.length) return dashboardEmptyState(emptyTitle);
+
+    return `
+        <div class="asset-activity-list">
+            ${items.map(item => `
+                <div class="asset-activity-item">
+                    <div>
+                        <strong>${escHtml(item.asset_tag || '-')}</strong>
+                        <span>${escHtml(item.asset_name || 'Unnamed asset')}</span>
+                    </div>
+                    <div>
+                        <span>${escHtml(item.assigned_to_name || 'Unassigned')}</span>
+                        <small>${formatDate(item[dateKey])}</small>
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderAnalyticsDashboard(data) {
+    return `
+        <div class="dashboard-section">
+            <div class="dashboard-section-header">
+                <div>
+                    <h2>Ticket Analytics</h2>
+                    <p>Operational overview of ticket volume, status, priority, and creation trends.</p>
+                </div>
+            </div>
+        </div>
+        ${renderTicketSummaryCards(data.tickets)}
+        <div class="dashboard-charts-grid">
+            <div class="card chart-card chart-card-large">
+                <div class="card-header"><span class="card-title">Tickets Created Per Month</span></div>
+                <div class="card-body">${renderLineChart(data.ticketsPerMonth || [], 'Tickets created per month')}</div>
+            </div>
+            <div class="card chart-card">
+                <div class="card-header"><span class="card-title">Tickets by Status</span></div>
+                <div class="card-body">${renderDonutChart(data.ticketsByStatus || [], 'status', 'tickets')}</div>
+            </div>
+            <div class="card chart-card">
+                <div class="card-header"><span class="card-title">Tickets by Priority</span></div>
+                <div class="card-body">${renderHorizontalBars(data.ticketsByPriority || [], 'priority')}</div>
+            </div>
+        </div>
+
+        <div class="dashboard-section">
+            <div class="dashboard-section-header">
+                <div>
+                    <h2>Asset Analytics</h2>
+                    <p>Inventory health, allocation status, category mix, and assignment movement.</p>
+                </div>
+            </div>
+        </div>
+        ${renderAssetSummaryCards(data.assets)}
+        <div class="dashboard-charts-grid asset-dashboard-grid">
+            <div class="card chart-card">
+                <div class="card-header"><span class="card-title">Assets by Status</span></div>
+                <div class="card-body">${renderDonutChart(data.assetsByStatus || [], 'status', 'assets')}</div>
+            </div>
+            <div class="card chart-card">
+                <div class="card-header"><span class="card-title">Assets by Category</span></div>
+                <div class="card-body">${renderHorizontalBars(data.assetsByCategory || [], 'category')}</div>
+            </div>
+            <div class="card chart-card chart-card-large">
+                <div class="card-header"><span class="card-title">Asset Assignment Trends</span></div>
+                <div class="card-body">${renderDualLineChart(data.assetAssignmentsPerMonth || [], data.assetReturnsPerMonth || [])}</div>
+            </div>
+            <div class="card chart-card">
+                <div class="card-header"><span class="card-title">Recently Assigned</span></div>
+                <div class="card-body">${renderRecentAssetList(data.recentlyAssignedAssets || [], 'assigned_at', 'No recent assignments')}</div>
+            </div>
+            <div class="card chart-card">
+                <div class="card-header"><span class="card-title">Recently Returned</span></div>
+                <div class="card-body">${renderRecentAssetList(data.recentlyReturnedAssets || [], 'returned_at', 'No recent returns')}</div>
+            </div>
+        </div>
+    `;
+}
+
+async function dashboard() {
+    const pageEl = document.getElementById('page-content');
+    const showAnalytics = canViewDashboardAnalytics();
+    const recentTicketsEndpoint = currentUser.can_view_all_tickets
+        ? '/tickets?limit=10'
+        : `/tickets?limit=10&created_by=${currentUser.user_id}`;
+    const loadingAnalytics = showAnalytics ? '<div class="card"><div class="card-body"><div class="empty-state"><p>Loading dashboard analytics...</p></div></div></div>' : '';
+    pageEl.innerHTML = loadingAnalytics;
+
+    try {
+        const requests = [API.get(recentTicketsEndpoint)];
+        if (showAnalytics) requests.unshift(API.get('/dashboard/stats'));
+        const results = await Promise.all(requests);
+        const dashboardData = showAnalytics ? results[0] : null;
+        const ticketsData = showAnalytics ? results[1] : results[0];
+        const tks = ticketsData.tickets || [];
+        const analyticsHtml = showAnalytics
+            ? (dashboardData.success === false
+                ? `<div class="alert alert-error">${escHtml(dashboardData.message || 'Unable to load dashboard analytics.')}</div>`
+                : renderAnalyticsDashboard(dashboardData))
+            : '';
+
+        pageEl.innerHTML = `
+            ${analyticsHtml}
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Recent Tickets</span>
+                    <button class="btn btn-secondary btn-sm" onclick="navigateTo('${currentUser.can_assign_tickets ? 'tickets' : 'my-tickets'}')">View All</button>
+                </div>
+                <div class="table-wrapper">
+                    ${tks.length ? renderTicketTable(tks) : dashboardEmptyState('No recent tickets', 'Created tickets will appear here.')}
+                </div>
+            </div>
+        `;
+    } catch (err) {
+        pageEl.innerHTML = `
+            <div class="alert alert-error">Unable to load dashboard. Please try again.</div>
+            <div class="card"><div class="card-body">${dashboardEmptyState('Dashboard unavailable')}</div></div>
+        `;
+    }
 }
 
 // ─── TICKETS LIST ───
@@ -242,12 +899,15 @@ async function tickets(assignedFilter = '') {
 }
 
 async function renderTicketList(filters = {}) {
+    currentTicketFilters = { ...filters };
     const pageEl = document.getElementById('page-content');
 
     const params = new URLSearchParams();
     if (filters.status) params.set('status', filters.status);
     if (filters.priority) params.set('priority', filters.priority);
     if (filters.assigned) params.set('assigned', filters.assigned);
+    if (filters.created_by) params.set('created_by', filters.created_by);
+    if (filters.mine) params.set('mine', filters.mine);
     if (filters.search) params.set('search', filters.search);
     if (filters.page) params.set('page', filters.page);
 
@@ -305,7 +965,12 @@ function applyFilters() {
     const status = document.getElementById('filter-status')?.value;
     const priority = document.getElementById('filter-priority')?.value;
     const assigned = document.getElementById('filter-assigned')?.value;
-    renderTicketList({ search, status, priority, assigned });
+    renderTicketList({ ...currentTicketFilters, search, status, priority, assigned, page: undefined });
+}
+
+function refreshActiveTicketList() {
+    if (!['tickets', 'my-tickets'].includes(currentPage)) return;
+    renderTicketList(currentTicketFilters);
 }
 
 function renderTicketTable(tickets) {
@@ -359,7 +1024,287 @@ function renderPagination(page, totalPages, total) {
 
 // ─── MY TICKETS ───
 async function myTickets() {
-    await renderTicketList({ created_by: currentUser.user_id });
+    await renderTicketList({ mine: '1' });
+}
+
+// ─── ACTIVITY LOGS ───
+async function activityLogsPage(filters = currentActivityLogFilters) {
+    currentActivityLogFilters = filters || {};
+    const pageEl = document.getElementById('page-content');
+    pageEl.innerHTML = '<div class="empty-state"><div class="empty-icon">L</div><p>Loading activity logs...</p></div>';
+
+    const params = new URLSearchParams();
+    if (currentActivityLogFilters.search) params.set('search', currentActivityLogFilters.search);
+    if (currentActivityLogFilters.module) params.set('module', currentActivityLogFilters.module);
+    if (currentActivityLogFilters.date) params.set('date', currentActivityLogFilters.date);
+    if (currentActivityLogFilters.page) params.set('page', currentActivityLogFilters.page);
+
+    try {
+        const data = await API.get(`/activity-logs?${params}`);
+        if (!data.success) {
+            pageEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to load activity logs.')}</div>`;
+            return;
+        }
+
+        const logs = data.logs || [];
+        pageEl.innerHTML = `
+            <div class="filters-bar">
+                <div class="search-input-wrap">
+                    <span class="search-icon">🔍</span>
+                    <input type="text" placeholder="Search user, action, details..." id="activity-search" value="${escHtml(currentActivityLogFilters.search || '')}">
+                </div>
+                <select class="filter-select" id="activity-module" onchange="applyActivityLogFilters()">
+                    <option value="">All modules</option>
+                    ${(data.modules || []).map(module => `<option value="${escHtml(module)}" ${currentActivityLogFilters.module === module ? 'selected' : ''}>${escHtml(module)}</option>`).join('')}
+                </select>
+                <input type="date" class="filter-select" id="activity-date" value="${escHtml(currentActivityLogFilters.date || '')}" onchange="applyActivityLogFilters()">
+                <button class="btn btn-secondary btn-sm" onclick="clearActivityLogFilters()">Clear</button>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Audit Trail</span>
+                    <span style="font-size:12px;color:var(--text-muted);">${data.total || 0} records</span>
+                </div>
+                <div class="table-wrapper">
+                    ${logs.length ? renderActivityLogTable(logs) : '<div class="empty-state"><div class="empty-icon">L</div><h3>No activity logs found</h3><p>Try adjusting your filters.</p></div>'}
+                </div>
+                ${data.total > data.limit ? renderActivityLogPagination(data.page, Math.ceil(data.total / data.limit), data.total) : ''}
+            </div>
+        `;
+
+        let searchTimer;
+        document.getElementById('activity-search')?.addEventListener('input', () => {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(() => applyActivityLogFilters(), 400);
+        });
+    } catch (err) {
+        pageEl.innerHTML = '<div class="alert alert-error">Unable to load activity logs. Please try again.</div>';
+    }
+}
+
+// ─── REPORTS EXPORT ───
+async function reportsPage() {
+    if (!['Super Admin', 'Admin'].includes(currentUser.role_name)) {
+        document.getElementById('page-content').innerHTML = '<div class="alert alert-error">Insufficient permissions.</div>';
+        return;
+    }
+
+    const [ticketCats, assetCats] = await Promise.all([
+        API.get('/users/categories'),
+        assetRequest('GET', '/categories')
+    ]);
+    const ticketCategoryOptions = (ticketCats.categories || []).map(c => `<option value="${c.category_id}">${escHtml(c.category_name)}</option>`).join('');
+    const assetCategoryOptions = (assetCats.categories || []).map(c => `<option value="${c.category_id}">${escHtml(c.category_name)}</option>`).join('');
+
+    document.getElementById('page-content').innerHTML = `
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">Report Filters</span>
+                <span style="font-size:12px;color:var(--text-muted);">PDF and Excel exports</span>
+            </div>
+            <div class="card-body">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Report Type</label>
+                        <select class="form-select" id="report-type" onchange="updateReportFilterOptions()">
+                            <option value="tickets">Tickets</option>
+                            <option value="assets">Assets</option>
+                            <option value="assigned-assets">Assigned Assets</option>
+                            <option value="returned-assets">Returned Assets</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Date From</label>
+                        <input type="date" class="form-input" id="report-date-from">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Date To</label>
+                        <input type="date" class="form-input" id="report-date-to">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Status</label>
+                        <select class="form-select" id="report-status"></select>
+                    </div>
+                    <div class="form-group" id="report-priority-wrap">
+                        <label class="form-label">Priority</label>
+                        <select class="form-select" id="report-priority">
+                            <option value="">All priorities</option>
+                            <option value="Urgent">Urgent</option>
+                            <option value="High">High</option>
+                            <option value="Normal">Normal</option>
+                            <option value="Low">Low</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Category</label>
+                        <select class="form-select" id="report-category" data-ticket-options="${escHtml(ticketCategoryOptions)}" data-asset-options="${escHtml(assetCategoryOptions)}"></select>
+                    </div>
+                </div>
+                <div class="report-actions">
+                    <button class="btn btn-primary" id="export-pdf-btn" onclick="exportReport('pdf')">Export PDF</button>
+                    <button class="btn btn-secondary" id="export-xlsx-btn" onclick="exportReport('xlsx')">Export Excel</button>
+                </div>
+                <div id="report-export-alert" style="margin-top:12px;"></div>
+            </div>
+        </div>
+        <div class="card" style="margin-top:16px;">
+            <div class="card-body">
+                <div style="font-size:13px;color:var(--text-secondary);line-height:1.7;">
+                    Reports include HelpDesk system name, generated date, active filters, summary totals, and table data from the database.
+                </div>
+            </div>
+        </div>
+    `;
+    updateReportFilterOptions();
+}
+
+function updateReportFilterOptions() {
+    const type = document.getElementById('report-type')?.value || 'tickets';
+    const isTickets = type === 'tickets';
+    const status = document.getElementById('report-status');
+    const category = document.getElementById('report-category');
+    const priorityWrap = document.getElementById('report-priority-wrap');
+
+    const ticketStatuses = ['Open', 'In Progress', 'Pending', 'Resolved', 'Closed'];
+    const assetStatuses = ['Available', 'Assigned', 'For Inspection', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'];
+    status.innerHTML = `<option value="">All statuses</option>${(isTickets ? ticketStatuses : assetStatuses).map(s => `<option value="${s}">${s}</option>`).join('')}`;
+    category.innerHTML = `<option value="">All categories</option>${isTickets ? category.dataset.ticketOptions : category.dataset.assetOptions}`;
+    priorityWrap.style.display = isTickets ? '' : 'none';
+}
+
+async function exportReport(format) {
+    const type = document.getElementById('report-type')?.value;
+    const params = new URLSearchParams({ type, format });
+    const dateFrom = document.getElementById('report-date-from')?.value;
+    const dateTo = document.getElementById('report-date-to')?.value;
+    const status = document.getElementById('report-status')?.value;
+    const priority = document.getElementById('report-priority')?.value;
+    const category = document.getElementById('report-category')?.value;
+    if (dateFrom) params.set('date_from', dateFrom);
+    if (dateTo) params.set('date_to', dateTo);
+    if (status) params.set('status', status);
+    if (type === 'tickets' && priority) params.set('priority', priority);
+    if (category) params.set('category_id', category);
+
+    const button = document.getElementById(format === 'pdf' ? 'export-pdf-btn' : 'export-xlsx-btn');
+    const alertEl = document.getElementById('report-export-alert');
+    const originalText = button?.textContent || 'Export';
+    if (button) {
+        button.disabled = true;
+        button.textContent = 'Preparing...';
+    }
+    if (alertEl) alertEl.innerHTML = '';
+
+    try {
+        const response = await fetch(`/api/reports/export?${params}`, { credentials: 'include' });
+        if (!response.ok) {
+            let message = 'Unable to export report.';
+            try {
+                const error = await response.json();
+                message = error.message || message;
+            } catch (err) {}
+            if (alertEl) alertEl.innerHTML = `<div class="alert alert-error">${escHtml(message)}</div>`;
+            return;
+        }
+
+        const blob = await response.blob();
+        if (!blob.size) {
+            if (alertEl) alertEl.innerHTML = '<div class="alert alert-error">Export returned an empty file.</div>';
+            return;
+        }
+
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const match = disposition.match(/filename="?([^"]+)"?/i);
+        const fallbackName = `${type || 'report'}.${format}`;
+        const fileName = match?.[1] || fallbackName;
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        if (alertEl) alertEl.innerHTML = '<div class="alert alert-success">Report exported successfully.</div>';
+    } catch (err) {
+        if (alertEl) alertEl.innerHTML = '<div class="alert alert-error">Unable to export report. Please try again.</div>';
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = originalText;
+        }
+    }
+}
+
+function applyActivityLogFilters(page = 1) {
+    activityLogsPage({
+        search: document.getElementById('activity-search')?.value?.trim(),
+        module: document.getElementById('activity-module')?.value,
+        date: document.getElementById('activity-date')?.value,
+        page
+    });
+}
+
+function clearActivityLogFilters() {
+    currentActivityLogFilters = {};
+    activityLogsPage({});
+}
+
+function renderActivityLogTable(logs) {
+    return `
+        <table>
+            <thead>
+                <tr>
+                    <th>Timestamp</th>
+                    <th>User</th>
+                    <th>Role</th>
+                    <th>Module</th>
+                    <th>Action</th>
+                    <th>Record</th>
+                    <th>Details</th>
+                </tr>
+            </thead>
+            <tbody>
+                ${logs.map(log => `
+                    <tr>
+                        <td style="color:var(--text-muted);font-size:12px;">${formatDate(log.created_at)}</td>
+                        <td><strong>${escHtml(log.user_name)}</strong></td>
+                        <td>${escHtml(log.user_role)}</td>
+                        <td><span class="activity-module-badge">${escHtml(log.module)}</span></td>
+                        <td>${escHtml(log.action)}</td>
+                        <td>${escHtml(log.record_id || '-')}</td>
+                        <td class="activity-details">${formatActivityDetails(log.details)}</td>
+                    </tr>
+                `).join('')}
+            </tbody>
+        </table>
+    `;
+}
+
+function formatActivityDetails(details) {
+    if (!details) return '<span style="color:var(--text-muted);">-</span>';
+    try {
+        const parsed = JSON.parse(details);
+        return escHtml(Object.entries(parsed).map(([key, value]) => `${key}: ${value}`).join(', '));
+    } catch (err) {
+        return escHtml(details);
+    }
+}
+
+function renderActivityLogPagination(page, totalPages, total) {
+    return `
+        <div class="pagination">
+            <span>${total} total logs</span>
+            <div class="pagination-pages">
+                ${page > 1 ? `<button class="page-btn" onclick="applyActivityLogFilters(${page - 1})">‹</button>` : ''}
+                ${Array.from({length: Math.min(totalPages, 7)}, (_, i) => i + 1).map(p =>
+                    `<button class="page-btn ${p === page ? 'active' : ''}" onclick="applyActivityLogFilters(${p})">${p}</button>`
+                ).join('')}
+                ${page < totalPages ? `<button class="page-btn" onclick="applyActivityLogFilters(${page + 1})">›</button>` : ''}
+            </div>
+        </div>
+    `;
 }
 
 // ─── TICKET DETAIL ───
@@ -1447,7 +2392,7 @@ let currentAssetId = null;
 let currentAssetFilters = {};
 let selectedAssetFiles = [];
 
-const ASSET_STATUSES = ['Available', 'Assigned', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'];
+const ASSET_STATUSES = ['Available', 'Assigned', 'For Inspection', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'];
 
 function canManageAssets() {
     return ['Super Admin', 'Admin', 'Staff'].includes(currentUser?.role_name);
@@ -1664,9 +2609,17 @@ function getAssetStats(assets) {
         total: assets.length,
         available: assets.filter(a => a.status === 'Available').length,
         assigned: assets.filter(a => a.status === 'Assigned').length,
-        repair: assets.filter(a => a.status === 'Under Repair').length,
-        inactive: assets.filter(a => ['Returned', 'Pulled Out', 'Retired', 'Lost'].includes(a.status)).length
+        repair: assets.filter(a => ['For Inspection', 'Under Repair'].includes(a.status)).length,
+        inactive: assets.filter(a => ['Returned', 'For Inspection', 'Pulled Out', 'Retired', 'Lost'].includes(a.status)).length
     };
+}
+
+function assetNeedsInspectionWarning(asset) {
+    return Number(asset.returned_inspection_warning || asset.returnedInspectionWarning || 0) === 1;
+}
+
+function assetStatusCell(asset) {
+    return `${assetStatusBadge(asset.status)}${assetNeedsInspectionWarning(asset) ? '<div style="margin-top:4px;"><span class="badge badge-pending">7+ days pending inspection</span></div>' : ''}`;
 }
 
 function applyAssetFilters() {
@@ -1704,7 +2657,7 @@ function renderAssetTable(assets, opts = {}) {
                             <div style="color:var(--text-muted);font-size:12px;">${escHtml([a.brand, a.model].filter(Boolean).join(' ') || a.serial_number || '')}</div>
                         </td>
                         <td>${escHtml(a.category_name || a.category || '-')}</td>
-                        <td>${assetStatusBadge(a.status)}</td>
+                        <td>${assetStatusCell(a)}</td>
                         ${opts.userView ? '' : `<td>${escHtml(a.assigned_to_name || a.assigned_user_name || '-')}</td>`}
                         <td>${escHtml(a.department || '-')}</td>
                         <td>${escHtml(a.location || '-')}</td>
@@ -1713,6 +2666,7 @@ function renderAssetTable(assets, opts = {}) {
                             <div style="display:flex;gap:4px;flex-wrap:wrap;">
                                 <button class="btn btn-secondary btn-sm" onclick="openAssetDetails(${a.asset_id})">View</button>
                                 ${canManageAssets() ? `<button class="btn btn-secondary btn-sm" onclick="openEditAsset(${a.asset_id})">Edit</button>` : ''}
+                                ${canManageAssets() && ['Returned', 'For Inspection', 'Under Repair'].includes(a.status) ? `<button class="btn btn-sm" style="background:var(--success-light);color:var(--success);" onclick="markAssetAvailable(${a.asset_id})">Mark Available</button>` : ''}
                                 ${canManageAssets() ? `<button class="btn btn-sm" style="background:var(--danger-light);color:var(--danger);" onclick="deleteAsset(${a.asset_id})">Retire</button>` : ''}
                             </div>
                         </td>
@@ -1811,7 +2765,7 @@ function renderAssetForm(asset, meta, isEdit) {
                             </div>
                             <div class="form-group">
                                 <label class="form-label">Status</label>
-                                <select class="form-select" id="asset-form-status">
+                                <select class="form-select" id="asset-form-status" onchange="syncAssetAssignmentFields()">
                                     ${ASSET_STATUSES.map(s => `<option value="${s}" ${(asset.status || 'Available') === s ? 'selected' : ''}>${s}</option>`).join('')}
                                 </select>
                             </div>
@@ -1831,7 +2785,7 @@ function renderAssetForm(asset, meta, isEdit) {
                                 <label class="form-label">Serial Number</label>
                                 <input class="form-input" id="asset-serial" value="${escHtml(asset.serial_number || '')}" placeholder="Serial number">
                             </div>
-                            <div class="form-group">
+                            <div class="form-group" id="asset-assigned-group">
                                 <label class="form-label">Assigned User</label>
                                 <select class="form-select" id="asset-assigned-to" onchange="applyAssignedUserMeta()">
                                     <option value="">Unassigned</option>
@@ -1840,7 +2794,7 @@ function renderAssetForm(asset, meta, isEdit) {
                             </div>
                         </div>
                         <div class="form-row">
-                            <div class="form-group">
+                            <div class="form-group" id="asset-department-group">
                                 <label class="form-label">Department</label>
                                 <select class="form-select" id="asset-form-department">
                                     <option value="">Select department...</option>
@@ -1853,7 +2807,7 @@ function renderAssetForm(asset, meta, isEdit) {
                             </div>
                         </div>
                         <div class="form-row">
-                            <div class="form-group">
+                            <div class="form-group" id="asset-role-group">
                                 <label class="form-label">Role</label>
                                 <input class="form-input" id="asset-user-role" value="" disabled style="opacity:0.75;">
                             </div>
@@ -1896,6 +2850,30 @@ function renderAssetForm(asset, meta, isEdit) {
         </div>
     `;
     document.getElementById('asset-form').addEventListener('submit', e => submitAssetForm(e, asset.asset_id));
+    syncAssetAssignmentFields();
+}
+
+function assetStatusAllowsAssignment(status) {
+    return status === 'Assigned' || status === 'Under Repair';
+}
+
+function syncAssetAssignmentFields() {
+    const status = document.getElementById('asset-form-status')?.value || 'Available';
+    const allowAssignment = assetStatusAllowsAssignment(status);
+    const assignedGroup = document.getElementById('asset-assigned-group');
+    const departmentGroup = document.getElementById('asset-department-group');
+    const roleGroup = document.getElementById('asset-role-group');
+    const assignedEl = document.getElementById('asset-assigned-to');
+    const departmentEl = document.getElementById('asset-form-department');
+    const roleEl = document.getElementById('asset-user-role');
+
+    [assignedGroup, departmentGroup, roleGroup].forEach(el => el?.classList.toggle('hidden', !allowAssignment));
+    if (!allowAssignment) {
+        if (assignedEl) assignedEl.value = '';
+        if (departmentEl) departmentEl.value = '';
+        if (roleEl) roleEl.value = '';
+        return;
+    }
     applyAssignedUserMeta();
 }
 
@@ -1968,8 +2946,8 @@ async function submitAssetForm(e, assetId = null) {
         model: document.getElementById('asset-model').value.trim(),
         serial_number: document.getElementById('asset-serial').value.trim(),
         status: document.getElementById('asset-form-status').value,
-        assigned_to: document.getElementById('asset-assigned-to').value || null,
-        department: document.getElementById('asset-form-department').value,
+        assigned_to: assetStatusAllowsAssignment(document.getElementById('asset-form-status').value) ? (document.getElementById('asset-assigned-to').value || null) : null,
+        department: assetStatusAllowsAssignment(document.getElementById('asset-form-status').value) ? document.getElementById('asset-form-department').value : '',
         location: document.getElementById('asset-location').value.trim(),
         purchase_date: document.getElementById('asset-purchase-date').value || null,
         warranty_expiry: document.getElementById('asset-warranty-expiry').value || null,
@@ -2034,6 +3012,20 @@ async function deleteAsset(assetId) {
     }
 }
 
+async function markAssetAvailable(assetId) {
+    if (!canManageAssets()) return showToast('Insufficient permissions.', 'error');
+    if (!confirm('Mark this returned asset as Available?')) return;
+
+    const data = await assetRequest('PATCH', `/${assetId}/mark-available`);
+    if (data.success) {
+        showToast('Asset marked as available.', 'success');
+        if (currentPage === 'asset-details') openAssetDetails(assetId);
+        else assetsPage();
+    } else {
+        showToast(data.message || 'Unable to mark asset as available.', 'error');
+    }
+}
+
 async function assetDetailsPage(assetId) {
     if (!assetId) return navigateTo('assets');
     const data = await assetRequest('GET', `/${assetId}`);
@@ -2049,7 +3041,7 @@ async function assetDetailsPage(assetId) {
     const assignments = data.assignments || data.assignment_history || [];
     const maintenance = data.maintenance_logs || data.maintenance || [];
     const tickets = data.tickets || [];
-    const activity = data.activity_logs || [];
+    const activity = data.asset_history || data.activity_logs || [];
     const attachments = data.attachments || [];
     const isCurrentUserAsset = data.is_currently_assigned_to_user !== false && asset.assigned_to === currentUser.user_id && asset.status === 'Assigned';
     const returnedContext = getReturnedAssetContext(asset, assignments, tickets);
@@ -2058,6 +3050,7 @@ async function assetDetailsPage(assetId) {
             <button class="btn btn-secondary btn-sm" onclick="navigateTo('assets')">Back</button>
             <div style="display:flex;gap:8px;flex-wrap:wrap;">
                 ${canManageAssets() ? `<button class="btn btn-secondary btn-sm" onclick="openMaintenanceModal(${asset.asset_id})">Add Maintenance</button>` : ''}
+                ${canManageAssets() && ['Returned', 'For Inspection', 'Under Repair'].includes(asset.status) ? `<button class="btn btn-sm" style="background:var(--success-light);color:var(--success);" onclick="markAssetAvailable(${asset.asset_id})">Mark as Available</button>` : ''}
                 ${canManageAssets() ? `<button class="btn btn-primary btn-sm" onclick="openEditAsset(${asset.asset_id})">Edit Asset</button>` : ''}
                 ${canManageAssets() ? `<button class="btn btn-sm" style="background:var(--danger-light);color:var(--danger);" onclick="deleteAsset(${asset.asset_id})">Retire</button>` : ''}
             </div>
@@ -2075,7 +3068,7 @@ async function assetDetailsPage(assetId) {
                     <span class="ticket-number">${escHtml(asset.asset_tag)}</span>
                     <div class="card-title" style="margin-top:4px;">${escHtml(asset.asset_name)}</div>
                 </div>
-                ${assetStatusBadge(asset.status)}
+                <div>${assetStatusCell(asset)}</div>
             </div>
             <div class="card-body">
                 <div class="ticket-detail-grid">
@@ -2086,7 +3079,7 @@ async function assetDetailsPage(assetId) {
                             <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-assignments')">Assignments (${assignments.length})</button>
                             <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-maintenance')">Maintenance (${maintenance.length})</button>
                             <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-files')">Files (${attachments.length})</button>
-                            ${canManageAssets() ? `<button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-activity')">Activity (${activity.length})</button>` : ''}
+                            <button class="tab-btn" onclick="switchAssetDetailTab('asset-tab-history')">History (${activity.length})</button>
                         </div>
                         <div id="asset-tab-details">
                             <p style="color:var(--text-secondary);font-size:13.5px;line-height:1.7;margin-bottom:20px;">${escHtml(asset.notes || 'No notes recorded for this asset.')}</p>
@@ -2112,7 +3105,7 @@ async function assetDetailsPage(assetId) {
                         <div id="asset-tab-files" class="hidden">
                             ${renderAssetAttachments(attachments)}
                         </div>
-                        ${canManageAssets() ? `<div id="asset-tab-activity" class="hidden">${renderAssetActivityLogs(activity)}</div>` : ''}
+                        <div id="asset-tab-history" class="hidden">${renderAssetHistoryTimeline(activity)}</div>
                     </div>
                     <div>
                         ${assetSideMeta('Category', asset.category_name || asset.category)}
@@ -2129,7 +3122,7 @@ async function assetDetailsPage(assetId) {
 }
 
 function getReturnedAssetContext(asset, assignments, tickets) {
-    const returnedAssignment = assignments.find(a => a.returned_at || ['Returned', 'Pulled Out'].includes(a.return_status));
+    const returnedAssignment = assignments.find(a => a.returned_at || ['Returned', 'For Inspection', 'Pulled Out'].includes(a.return_status));
     const relatedTicket = returnedAssignment?.related_ticket_id
         ? {
             ticket_id: returnedAssignment.related_ticket_id,
@@ -2143,7 +3136,7 @@ function getReturnedAssetContext(asset, assignments, tickets) {
         }
         : tickets[0];
 
-    if (!returnedAssignment && !['Returned', 'Pulled Out', 'Retired', 'Lost'].includes(asset.status)) return null;
+    if (!returnedAssignment && !['Returned', 'For Inspection', 'Pulled Out', 'Retired', 'Lost'].includes(asset.status)) return null;
     return { assignment: returnedAssignment || {}, ticket: relatedTicket || null };
 }
 
@@ -2177,7 +3170,7 @@ function renderReturnedAssetDetails(context) {
 }
 
 function switchAssetDetailTab(activeId) {
-    ['asset-tab-details','asset-tab-tickets','asset-tab-assignments','asset-tab-maintenance','asset-tab-files','asset-tab-activity'].forEach(id => {
+    ['asset-tab-details','asset-tab-tickets','asset-tab-assignments','asset-tab-maintenance','asset-tab-files','asset-tab-history'].forEach(id => {
         document.getElementById(id)?.classList.toggle('hidden', id !== activeId);
     });
     document.querySelectorAll('#page-content .tabs .tab-btn').forEach(btn => {
@@ -2306,6 +3299,99 @@ function renderAssetActivityLogs(logs) {
     `;
 }
 
+function assetHistoryTone(action = '') {
+    if (action.includes('created')) return 'success';
+    if (action.includes('assigned')) return 'accent';
+    if (action.includes('returned') || action.includes('return')) return 'warning';
+    if (action.includes('pulled')) return 'danger';
+    if (action.includes('updated') || action.includes('changed')) return 'neutral';
+    return 'neutral';
+}
+
+function assetHistoryRemarks(item) {
+    const parts = [];
+    if (item.assigned_employee_name) parts.push(`Employee: ${item.assigned_employee_name}`);
+    if (item.related_ticket_number) parts.push(`Ticket: ${item.related_ticket_number}`);
+
+    const oldValue = item.old_value && item.old_value !== 'null' ? formatAssetHistoryValue(item.old_value) : '';
+    const newValue = item.new_value && item.new_value !== 'null' ? formatAssetHistoryValue(item.new_value) : '';
+    if (oldValue || newValue) {
+        if (oldValue && newValue) parts.push(`${oldValue} -> ${newValue}`);
+        else if (newValue) parts.push(newValue);
+        else parts.push(oldValue);
+    }
+
+    return parts.length ? parts.join(' | ') : 'No remarks recorded.';
+}
+
+function formatAssetHistoryValue(value) {
+    if (!value) return '';
+    const text = String(value);
+    try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const labels = {
+                asset_tag: 'Asset tag',
+                asset_name: 'Asset name',
+                category_id: 'Category',
+                brand: 'Brand',
+                model: 'Model',
+                serial_number: 'Serial number',
+                status: 'Status',
+                assigned_to: 'Assigned user',
+                department: 'Department',
+                location: 'Location',
+                purchase_date: 'Purchase date',
+                warranty_expiry: 'Warranty expiry',
+                supplier: 'Supplier',
+                notes: 'Notes'
+            };
+            return Object.entries(parsed)
+                .filter(([key, val]) => labels[key] && val !== null && val !== undefined && val !== '')
+                .map(([key, val]) => `${labels[key]}: ${val}`)
+                .join(', ');
+        }
+    } catch (err) {}
+    return text;
+}
+
+function renderAssetHistoryTimeline(history) {
+    if (!history.length) {
+        return '<div class="empty-state"><div class="empty-icon">A</div><h3>No asset history yet</h3><p>Asset events will appear here automatically.</p></div>';
+    }
+
+    return `
+        <div class="asset-history-timeline">
+            ${history.map(item => {
+                const action = String(item.action || 'Asset activity');
+                const tone = assetHistoryTone(action.toLowerCase());
+                return `
+                    <div class="asset-history-item ${tone}">
+                        <div class="asset-history-marker"></div>
+                        <div class="asset-history-card">
+                            <div class="asset-history-head">
+                                <div>
+                                    <div class="asset-history-action">${escHtml(action)}</div>
+                                    <div class="asset-history-meta">
+                                        ${escHtml(item.changed_by_name || 'System')}
+                                        ${item.changed_by_role_name ? ` (${escHtml(item.changed_by_role_name)})` : ''}
+                                    </div>
+                                </div>
+                                <div class="asset-history-date">${formatDate(item.created_at)}</div>
+                            </div>
+                            <div class="asset-history-details">
+                                ${item.assigned_employee_name ? `<span>Assigned employee: <strong>${escHtml(item.assigned_employee_name)}</strong></span>` : ''}
+                                ${item.related_ticket_number ? `<span>Related ticket: <strong>${escHtml(item.related_ticket_number)}</strong></span>` : ''}
+                                <span>Remarks: ${escHtml(assetHistoryRemarks(item))}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('')}
+        </div>
+    `;
+}
+
 async function openAllAssetActivityLogs() {
     if (!canManageAssets()) return showToast('Insufficient permissions.', 'error');
     const data = await assetRequest('GET', '/activity-logs');
@@ -2424,6 +3510,7 @@ function assetStatusBadge(status) {
     const map = {
         Available: 'resolved',
         Assigned: 'normal',
+        'For Inspection': 'pending',
         'Under Repair': 'pending',
         Returned: 'closed',
         'Pulled Out': 'urgent',

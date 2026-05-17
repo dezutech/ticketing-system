@@ -5,8 +5,10 @@ const path = require('path');
 const fs = require('fs');
 const { query, sql } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { logActivity } = require('../utils/activityLogger');
+const { notifyUsers } = require('../utils/notificationService');
 
-const ASSET_STATUSES = ['Available', 'Assigned', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'];
+const ASSET_STATUSES = ['Available', 'Assigned', 'For Inspection', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'];
 const MAINTENANCE_STATUSES = ['Scheduled', 'In Progress', 'Completed', 'Cancelled'];
 const ASSET_MANAGER_ROLES = ['Super Admin', 'Admin', 'Staff'];
 
@@ -95,6 +97,10 @@ function validateAssetPayload(body, isUpdate = false) {
     }
     if (body.assigned_to && !isIntegerValue(body.assigned_to)) {
         return 'Invalid assigned user.';
+    }
+    if (body.status && ['Available', 'For Inspection', 'Returned', 'Pulled Out', 'Retired', 'Lost'].includes(body.status)) {
+        body.assigned_to = null;
+        body.department = '';
     }
     return null;
 }
@@ -187,6 +193,18 @@ async function markAssignmentReturned(assetId, assignedTo, returnStatus, returnC
             WHERE asset_id = @assetId AND assigned_to = @assignedTo AND returned_at IS NULL
         `, inputs);
     }
+}
+
+function returnedInspectionWarningSql(alias = 'latestReturn') {
+    return `
+        CASE
+            WHEN a.status = 'Returned'
+                AND ${alias}.returned_at IS NOT NULL
+                AND DATEDIFF(day, ${alias}.returned_at, GETDATE()) > 7
+            THEN 1 ELSE 0
+        END AS returned_inspection_warning,
+        ${alias}.returned_at AS latest_returned_at
+    `;
 }
 
 async function saveAssetAttachments(assetId, files, userId) {
@@ -338,10 +356,17 @@ router.get('/', authenticateToken, async (req, res) => {
 
         const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
         const result = await query(`
-            SELECT a.*, ac.category_name, u.full_name AS assigned_to_name
+            SELECT a.*, ac.category_name, u.full_name AS assigned_to_name,
+                   ${returnedInspectionWarningSql('latestReturn')}
             FROM assets a
             LEFT JOIN asset_categories ac ON a.category_id = ac.category_id
             LEFT JOIN Users u ON a.assigned_to = u.user_id
+            OUTER APPLY (
+                SELECT TOP 1 aa.returned_at
+                FROM asset_assignments aa
+                WHERE aa.asset_id = a.asset_id AND aa.returned_at IS NOT NULL
+                ORDER BY aa.returned_at DESC
+            ) latestReturn
             ${where}
             ORDER BY a.created_at DESC
         `, inputs);
@@ -351,7 +376,7 @@ router.get('/', authenticateToken, async (req, res) => {
             returnedAssets = await optionalQuery(`
                 SELECT a.*, ac.category_name, u.full_name AS assigned_to_name,
                     aa.assigned_at, aa.returned_at, aa.return_condition,
-                    aa.return_status, aa.return_notes,
+                    CAST('Returned' AS NVARCHAR(30)) AS return_status, aa.return_notes,
                     COALESCE(rt.ticket_id, lt.ticket_id) AS related_ticket_id,
                     COALESCE(rt.ticket_number, lt.ticket_number) AS related_ticket_number,
                     COALESCE(rt.title, lt.title) AS related_ticket_title,
@@ -359,7 +384,9 @@ router.get('/', authenticateToken, async (req, res) => {
                     COALESCE(rt.created_at, lt.created_at) AS related_ticket_created_at,
                     COALESCE(rt.resolved_at, lt.resolved_at) AS related_ticket_resolved_at,
                     COALESCE(rc.category_name, lc.category_name) AS related_ticket_category,
-                    COALESCE(rt.resolution_notes, lt.resolution_notes) AS related_ticket_notes
+                    COALESCE(rt.resolution_notes, lt.resolution_notes) AS related_ticket_notes,
+                    CAST(0 AS BIT) AS returned_inspection_warning,
+                    aa.returned_at AS latest_returned_at
                 FROM asset_assignments aa
                 JOIN assets a ON aa.asset_id = a.asset_id
                 LEFT JOIN asset_categories ac ON a.category_id = ac.category_id
@@ -376,7 +403,7 @@ router.get('/', authenticateToken, async (req, res) => {
                 LEFT JOIN Categories lc ON lt.category_id = lc.category_id
                 WHERE aa.assigned_to = @currentUserId
                     AND aa.returned_at IS NOT NULL
-                    AND (a.assigned_to IS NULL OR a.assigned_to <> @currentUserId OR a.status IN ('Returned', 'Pulled Out', 'Retired', 'Lost'))
+                    AND (a.assigned_to IS NULL OR a.assigned_to <> @currentUserId OR a.status IN ('Returned', 'For Inspection', 'Pulled Out', 'Retired', 'Lost'))
                 ORDER BY aa.returned_at DESC
             `, {
                 currentUserId: { type: sql.Int, value: req.user.user_id }
@@ -399,10 +426,17 @@ router.get('/:id', authenticateToken, async (req, res) => {
 
         const inputs = { id: { type: sql.Int, value: req.params.id } };
         const result = await query(`
-            SELECT a.*, ac.category_name, u.full_name AS assigned_to_name, u.email AS assigned_to_email
+            SELECT a.*, ac.category_name, u.full_name AS assigned_to_name, u.email AS assigned_to_email,
+                   ${returnedInspectionWarningSql('latestReturn')}
             FROM assets a
             LEFT JOIN asset_categories ac ON a.category_id = ac.category_id
             LEFT JOIN Users u ON a.assigned_to = u.user_id
+            OUTER APPLY (
+                SELECT TOP 1 aa.returned_at
+                FROM asset_assignments aa
+                WHERE aa.asset_id = a.asset_id AND aa.returned_at IS NOT NULL
+                ORDER BY aa.returned_at DESC
+            ) latestReturn
             WHERE a.asset_id = @id
         `, inputs);
 
@@ -411,8 +445,10 @@ router.get('/:id', authenticateToken, async (req, res) => {
         }
 
         const asset = result.recordset[0];
+        const isManager = canManageAssets(req.user);
+        const isCurrentUserAsset = asset.assigned_to === req.user.user_id && asset.status === 'Assigned';
         let userAssetHistory = [];
-        if (!canManageAssets(req.user)) {
+        if (!isManager) {
             userAssetHistory = await optionalQuery(`
                 SELECT TOP 1 assignment_id, returned_at, return_status, return_condition, return_notes, return_ticket_id
                 FROM asset_assignments
@@ -423,13 +459,12 @@ router.get('/:id', authenticateToken, async (req, res) => {
                 currentUserId: { type: sql.Int, value: req.user.user_id }
             });
 
-            const canViewCurrent = asset.assigned_to === req.user.user_id && asset.status === 'Assigned';
-            if (!canViewCurrent && !userAssetHistory.length) {
+            if (!isCurrentUserAsset && !userAssetHistory.length) {
                 return res.status(403).json({ success: false, message: 'Access denied.' });
             }
         }
 
-        const assignments = await optionalQuery(`
+        let assignments = await optionalQuery(`
             SELECT aa.*, assigned.full_name AS assigned_to_name, assigner.full_name AS assigned_by_name,
                    t.ticket_id AS related_ticket_id, t.ticket_number AS related_ticket_number,
                    t.title AS related_ticket_title, t.status AS related_ticket_status,
@@ -441,7 +476,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
             LEFT JOIN Tickets t ON aa.return_ticket_id = t.ticket_id
             LEFT JOIN Categories c ON t.category_id = c.category_id
             WHERE aa.asset_id = @id
-            ${canManageAssets(req.user) ? '' : 'AND aa.assigned_to = @currentUserId'}
+            ${isManager ? '' : 'AND aa.assigned_to = @currentUserId'}
             ORDER BY aa.assigned_at DESC
         `, {
             ...inputs,
@@ -456,7 +491,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
             ORDER BY aml.maintenance_date DESC
         `, inputs);
 
-        const ticketScope = canManageAssets(req.user) ? '' : 'AND (t.created_by = @currentUserId OR t.assigned_to = @currentUserId)';
+        const ticketScope = isManager ? '' : 'AND (t.created_by = @currentUserId OR t.assigned_to = @currentUserId)';
         const ticketInputs = {
             id: { type: sql.Int, value: req.params.id },
             currentUserId: { type: sql.Int, value: req.user.user_id }
@@ -475,16 +510,31 @@ router.get('/:id', authenticateToken, async (req, res) => {
             ORDER BY t.created_at DESC
         `, ticketInputs);
 
-        const activity = canManageAssets(req.user)
-            ? await optionalQuery(`
-                SELECT aal.*, u.full_name AS changed_by_name, t.ticket_number AS related_ticket_number
-                FROM asset_activity_logs aal
-                LEFT JOIN Users u ON aal.changed_by = u.user_id
-                LEFT JOIN Tickets t ON aal.ticket_id = t.ticket_id
-                WHERE aal.asset_id = @id
-                ORDER BY aal.created_at DESC
-            `, inputs)
-            : [];
+        let activity = await optionalQuery(`
+            SELECT aal.*, u.full_name AS changed_by_name, u.role_id AS changed_by_role_id,
+                   r.role_name AS changed_by_role_name,
+                   t.ticket_id AS related_ticket_id, t.ticket_number AS related_ticket_number,
+                   COALESCE(newAssigned.full_name, oldAssigned.full_name) AS assigned_employee_name,
+                   COALESCE(newAssigned.user_id, oldAssigned.user_id) AS assigned_employee_id
+            FROM asset_activity_logs aal
+            LEFT JOIN Users u ON aal.changed_by = u.user_id
+            LEFT JOIN Roles r ON u.role_id = r.role_id
+            LEFT JOIN Tickets t ON aal.ticket_id = t.ticket_id
+            LEFT JOIN Users newAssigned ON TRY_CONVERT(INT, aal.new_value) = newAssigned.user_id
+            LEFT JOIN Users oldAssigned ON TRY_CONVERT(INT, aal.old_value) = oldAssigned.user_id
+            WHERE aal.asset_id = @id
+            ORDER BY aal.created_at DESC
+        `, inputs);
+
+        if (!isManager && !isCurrentUserAsset) {
+            assignments = assignments.map(item => ({ ...item, return_status: item.returned_at ? 'Returned' : item.return_status }));
+            asset.status = 'Returned';
+            asset.assigned_to = null;
+            asset.assigned_to_name = null;
+            activity = activity
+                .filter(item => String(item.action || '').toLowerCase().includes('returned'))
+                .map(item => ({ ...item, action: 'Asset returned', old_value: null, new_value: 'Returned' }));
+        }
         const attachments = await optionalQuery(`
             SELECT aa.*, u.full_name AS uploaded_by_name
             FROM asset_attachments aa
@@ -496,12 +546,13 @@ router.get('/:id', authenticateToken, async (req, res) => {
         res.json({
             success: true,
             asset,
-            is_currently_assigned_to_user: asset.assigned_to === req.user.user_id && asset.status === 'Assigned',
+            is_currently_assigned_to_user: isCurrentUserAsset,
             user_asset_history: userAssetHistory,
             assignments,
             maintenance_logs: maintenance,
             tickets,
             activity_logs: activity,
+            asset_history: activity,
             attachments
         });
     } catch (err) {
@@ -535,6 +586,11 @@ router.post('/', authenticateToken, requireAssetManager, upload.array('attachmen
             asset_name: req.body.asset_name,
             status: req.body.status || 'Available'
         }, req.user.user_id);
+        await logActivity(req.user, 'Asset created', 'Assets', assetId, {
+            asset_tag: req.body.asset_tag,
+            asset_name: req.body.asset_name,
+            status: req.body.status || 'Available'
+        });
 
         if (req.body.assigned_to) {
             await optionalExecute(`
@@ -549,6 +605,17 @@ router.post('/', authenticateToken, requireAssetManager, upload.array('attachmen
                 notes: { type: sql.NVarChar, value: 'Assigned during asset creation.' }
             });
             await logAssetActivity(assetId, 'Asset assigned', null, req.body.assigned_to, req.user.user_id);
+            await logActivity(req.user, 'Asset assigned', 'Assets', assetId, {
+                assigned_to: req.body.assigned_to,
+                source: 'creation'
+            });
+            await notifyUsers(
+                [req.body.assigned_to],
+                `Asset ${req.body.asset_tag} was assigned to you.`,
+                'Assets',
+                assetId,
+                `asset:${assetId}`
+            );
         }
 
         res.json({ success: true, message: 'Asset created.', asset_id: assetId });
@@ -578,8 +645,8 @@ router.patch('/:id', authenticateToken, requireAssetManager, upload.array('attac
         if (!existing.recordset.length) return res.status(404).json({ success: false, message: 'Asset not found.' });
         const oldAsset = existing.recordset[0];
         const finalStatus = body.status || oldAsset.status;
-        const returnLikeStatuses = ['Returned', 'Pulled Out'];
-        const unassignedStatuses = ['Available', 'Returned', 'Pulled Out', 'Retired', 'Lost'];
+        const returnLikeStatuses = ['Returned', 'For Inspection', 'Pulled Out'];
+        const unassignedStatuses = ['Available', 'For Inspection', 'Returned', 'Pulled Out', 'Retired', 'Lost'];
         const relatedTicketId = body.ticket_id || body.return_ticket_id || await getLatestAssetTicket(req.params.id);
 
         if (unassignedStatuses.includes(finalStatus)) {
@@ -622,10 +689,19 @@ router.patch('/:id', authenticateToken, requireAssetManager, upload.array('attac
         await query(`UPDATE assets SET ${updates.join(', ')} WHERE asset_id = @id`, inputs);
         await saveAssetAttachments(req.params.id, req.files, req.user.user_id);
         await logAssetActivity(req.params.id, 'Asset updated', oldAsset, body, req.user.user_id, relatedTicketId);
+        await logActivity(req.user, 'Asset edited', 'Assets', req.params.id, {
+            fields: updates.filter(field => field !== 'updated_at = GETDATE()').map(field => field.split('=')[0].trim()),
+            related_ticket_id: relatedTicketId
+        });
 
         if (body.status !== undefined && body.status !== oldAsset.status) {
-            const action = returnLikeStatuses.includes(body.status) ? `Asset ${body.status}` : 'Status changed';
+            const action = returnLikeStatuses.includes(body.status) ? (body.status === 'For Inspection' ? 'Asset returned for inspection' : `Asset ${body.status}`) : (body.status === 'Under Repair' ? 'Asset sent for repair' : 'Status changed');
             await logAssetActivity(req.params.id, action, oldAsset.status, body.status, req.user.user_id, relatedTicketId);
+            await logActivity(req.user, body.status === 'Pulled Out' ? 'Asset pull-out' : (['Returned', 'For Inspection'].includes(body.status) ? 'Asset returned' : (body.status === 'Under Repair' ? 'Asset sent for repair' : 'Asset status changed')), 'Assets', req.params.id, {
+                from: oldAsset.status,
+                to: body.status,
+                related_ticket_id: relatedTicketId
+            });
         }
 
         if (body.assigned_to !== undefined && String(body.assigned_to || '') !== String(oldAsset.assigned_to || '')) {
@@ -633,7 +709,7 @@ router.patch('/:id', authenticateToken, requireAssetManager, upload.array('attac
                 await markAssignmentReturned(
                     req.params.id,
                     oldAsset.assigned_to,
-                    body.return_status || (body.status === 'Pulled Out' ? 'Pulled Out' : 'Returned'),
+                    body.return_status || (body.status === 'Pulled Out' ? 'Pulled Out' : (body.status === 'For Inspection' ? 'For Inspection' : 'Returned')),
                     body.return_condition,
                     relatedTicketId,
                     body.return_notes || body.notes
@@ -645,6 +721,17 @@ router.patch('/:id', authenticateToken, requireAssetManager, upload.array('attac
                     null,
                     req.user.user_id,
                     relatedTicketId
+                );
+                await logActivity(req.user, body.status === 'Pulled Out' ? 'Asset pull-out' : 'Asset returned', 'Assets', req.params.id, {
+                    previous_assigned_to: oldAsset.assigned_to,
+                    related_ticket_id: relatedTicketId
+                });
+                await notifyUsers(
+                    [oldAsset.assigned_to],
+                    `Asset ${oldAsset.asset_tag} was ${body.status === 'Pulled Out' ? 'pulled out' : 'returned'}.`,
+                    'Assets',
+                    req.params.id,
+                    `asset:${req.params.id}`
                 );
             } else if (body.assigned_to) {
                 if (oldAsset.assigned_to) {
@@ -667,6 +754,17 @@ router.patch('/:id', authenticateToken, requireAssetManager, upload.array('attac
                     location: { type: sql.NVarChar, value: body.location || oldAsset.location || null }
                 });
                 await logAssetActivity(req.params.id, 'Asset assigned', oldAsset.assigned_to, body.assigned_to, req.user.user_id);
+                await logActivity(req.user, 'Asset assigned', 'Assets', req.params.id, {
+                    from: oldAsset.assigned_to,
+                    to: body.assigned_to
+                });
+                await notifyUsers(
+                    [body.assigned_to],
+                    `Asset ${oldAsset.asset_tag} was assigned to you.`,
+                    'Assets',
+                    req.params.id,
+                    `asset:${req.params.id}`
+                );
             }
         }
 
@@ -675,6 +773,47 @@ router.patch('/:id', authenticateToken, requireAssetManager, upload.array('attac
         if (err.message?.includes('UNIQUE')) {
             return res.status(400).json({ success: false, message: 'Asset tag already exists.' });
         }
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// PATCH /api/assets/:id/mark-available
+router.patch('/:id/mark-available', authenticateToken, requireAssetManager, async (req, res) => {
+    try {
+        if (!isIntegerValue(req.params.id)) {
+            return res.status(400).json({ success: false, message: 'Invalid asset.' });
+        }
+
+        const existing = await query(`SELECT * FROM assets WHERE asset_id = @id`, {
+            id: { type: sql.Int, value: req.params.id }
+        });
+        if (!existing.recordset.length) return res.status(404).json({ success: false, message: 'Asset not found.' });
+
+        const asset = existing.recordset[0];
+        if (!['Returned', 'For Inspection', 'Under Repair'].includes(asset.status)) {
+            return res.status(400).json({ success: false, message: 'Only returned, inspected, or repaired assets can be marked as available.' });
+        }
+
+        await query(`
+            UPDATE assets
+            SET status = 'Available',
+                assigned_to = NULL,
+                department = NULL,
+                updated_at = GETDATE()
+            WHERE asset_id = @id
+        `, {
+            id: { type: sql.Int, value: req.params.id }
+        });
+
+        await logAssetActivity(req.params.id, 'Asset marked as available', asset.status, 'Available', req.user.user_id);
+        await logActivity(req.user, 'Asset marked as available', 'Assets', req.params.id, {
+            from: asset.status,
+            to: 'Available'
+        });
+
+        res.json({ success: true, message: 'Asset marked as available.' });
+    } catch (err) {
         console.error(err);
         res.status(500).json({ success: false, message: 'Server error.' });
     }
@@ -758,6 +897,9 @@ router.delete('/:id', authenticateToken, requireAssetManager, async (req, res) =
         });
 
         await logAssetActivity(req.params.id, 'Asset deleted', existing.recordset[0], 'Retired', req.user.user_id);
+        await logActivity(req.user, 'Asset retired', 'Assets', req.params.id, {
+            previous_status: existing.recordset[0].status
+        });
         res.json({ success: true, message: 'Asset retired.' });
     } catch (err) {
         console.error(err);

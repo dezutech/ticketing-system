@@ -9,6 +9,12 @@ const authRoutes = require('./backend/routes/auth');
 const ticketRoutes = require('./backend/routes/tickets');
 const userRoutes = require('./backend/routes/users');
 const assetRoutes = require('./backend/routes/assets');
+const dashboardRoutes = require('./backend/routes/dashboard');
+const activityLogRoutes = require('./backend/routes/activityLogs');
+const reportRoutes = require('./backend/routes/reports');
+const notificationRoutes = require('./backend/routes/notifications');
+const backupRoutes = require('./backend/routes/backups');
+const { authenticateToken } = require('./backend/middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -23,13 +29,18 @@ app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Serve uploaded files (protected — you can add auth middleware here)
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', authenticateToken, express.static(path.join(__dirname, 'uploads')));
 
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/tickets', ticketRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/assets', assetRoutes);
+app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/activity-logs', activityLogRoutes);
+app.use('/api/reports', reportRoutes);
+app.use('/api/notifications', notificationRoutes);
+app.use('/api/backups', backupRoutes);
 
 // SPA fallback — serve index.html for all non-API routes
 app.get('*', (req, res) => {

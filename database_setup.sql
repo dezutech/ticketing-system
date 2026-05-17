@@ -244,6 +244,51 @@ IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('Users') AN
     ALTER TABLE Users ADD must_change_password BIT DEFAULT 0;
 GO
 
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'theme_preference')
+    ALTER TABLE Users ADD theme_preference NVARCHAR(20) NOT NULL CONSTRAINT DF_Users_theme_preference DEFAULT 'modern';
+GO
+
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'ActivityLogs')
+BEGIN
+    CREATE TABLE ActivityLogs (
+        log_id INT PRIMARY KEY IDENTITY(1,1),
+        user_id INT NULL,
+        user_name NVARCHAR(150) NOT NULL,
+        user_role NVARCHAR(80) NOT NULL,
+        action NVARCHAR(120) NOT NULL,
+        module NVARCHAR(80) NOT NULL,
+        record_id NVARCHAR(80) NULL,
+        details NVARCHAR(MAX) NULL,
+        created_at DATETIME NOT NULL DEFAULT GETDATE(),
+        FOREIGN KEY (user_id) REFERENCES Users(user_id)
+    );
+    CREATE INDEX IX_ActivityLogs_created_at ON ActivityLogs(created_at DESC);
+    CREATE INDEX IX_ActivityLogs_module ON ActivityLogs(module);
+    CREATE INDEX IX_ActivityLogs_action ON ActivityLogs(action);
+END
+GO
+
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'Notifications')
+BEGIN
+    CREATE TABLE Notifications (
+        notification_id INT PRIMARY KEY IDENTITY(1,1),
+        user_id INT NOT NULL,
+        title NVARCHAR(150) NULL,
+        message NVARCHAR(255) NOT NULL,
+        type NVARCHAR(50) NULL,
+        module NVARCHAR(50) NOT NULL,
+        record_id INT NULL,
+        related_ticket_id INT NULL,
+        related_asset_id INT NULL,
+        link_target NVARCHAR(120) NULL,
+        is_read BIT NOT NULL DEFAULT 0,
+        created_at DATETIME NOT NULL DEFAULT GETDATE(),
+        FOREIGN KEY (user_id) REFERENCES Users(user_id)
+    );
+    CREATE INDEX IX_Notifications_user_read ON Notifications(user_id, is_read, created_at DESC);
+END
+GO
+
 -- ============================================
 -- DEPARTMENTS TABLE
 -- ============================================
