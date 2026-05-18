@@ -36,7 +36,8 @@
             <button type="submit" class="btn btn-primary btn-lg" id="login-btn" style="width:100%;margin-top:8px;">Sign In</button>
         </form>
 
-        <div style="margin-top:24px;padding-top:16px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;">
+        <div class="login-forgot-password">
+            <button class="forgot-password-link" onclick="openSelfServicePortal()" type="button">Forgotten password?</button>
             <button class="btn-icon" onclick="toggleTheme()" id="theme-toggle" data-tip="Toggle dark mode" style="border:none;">🌙</button>
         </div>
     </div>
@@ -45,13 +46,102 @@
 <!-- ══════════════════════════════════════
      APP LAYOUT
 ══════════════════════════════════════ -->
+<div id="self-service-page" class="self-service-page hidden">
+    <div class="self-service-shell">
+        <div class="self-service-header">
+            <button class="btn btn-secondary btn-sm" onclick="returnToLogin()" type="button">Back to Login</button>
+            <button class="btn-icon" onclick="toggleTheme()" data-tip="Toggle theme" type="button" style="border:none;">🌙</button>
+        </div>
+        <div class="self-service-panel">
+            <div class="self-service-title">
+                <div class="logo-icon">H</div>
+                <div>
+                    <h1>Password Reset Request</h1>
+                    <p>Submit a support ticket for account access help. Passwords are not reset automatically.</p>
+                </div>
+            </div>
+            <div class="self-service-steps">
+                <span class="active" id="pr-step-dot-1">1</span>
+                <span id="pr-step-dot-2">2</span>
+                <span id="pr-step-dot-3">3</span>
+            </div>
+            <div id="self-service-alert"></div>
+            <form id="password-reset-find-form" class="account-search-form" onsubmit="submitPasswordResetFindAccount(event)">
+                <div class="form-group">
+                    <label class="form-label">Find Your Account</label>
+                    <input class="form-input account-search-input" id="pr-account-identifier" placeholder="Employee ID, username, or email" autocomplete="username" required>
+                </div>
+                <button class="btn btn-primary" id="password-reset-find-btn" type="submit" style="width:100%;justify-content:center;">Search</button>
+            </form>
+            <form id="password-reset-phone-form" class="hidden" onsubmit="submitPasswordResetVerifyPhone(event)">
+                <div class="verification-summary">
+                    <div>User found: <strong id="pr-found-name"></strong></div>
+                    <div>Registered phone: <strong id="pr-masked-phone"></strong></div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Type your full registered phone number <span class="required">*</span></label>
+                    <input class="form-input" id="pr-phone-verify" autocomplete="tel" required>
+                </div>
+                <div class="self-service-actions">
+                    <button class="btn btn-secondary" onclick="resetPasswordResetFlow()" type="button">Search Again</button>
+                    <button class="btn btn-primary" id="password-reset-verify-btn" type="submit">Continue</button>
+                </div>
+            </form>
+            <form id="password-reset-request-form" class="hidden" onsubmit="submitPasswordResetRequest(event)">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Full name</label>
+                        <input class="form-input" id="pr-full-name" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Username or email</label>
+                        <input class="form-input" id="pr-username-email" readonly>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Department</label>
+                        <input class="form-input" id="pr-department" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Branch</label>
+                        <input class="form-input" id="pr-branch" readonly>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">Contact number</label>
+                        <input class="form-input" id="pr-contact" readonly>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Account/system affected <span class="required">*</span></label>
+                        <input class="form-input" id="pr-system" placeholder="e.g. HelpDesk, Windows, Email" required>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Reason <span class="required">*</span></label>
+                    <textarea class="form-textarea" id="pr-reason" rows="4" required></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Additional notes</label>
+                    <textarea class="form-textarea" id="pr-notes" rows="3"></textarea>
+                </div>
+                <div class="self-service-actions">
+                    <button class="btn btn-secondary" onclick="resetPasswordResetFlow()" type="button">Start Over</button>
+                    <button class="btn btn-primary" id="password-reset-submit-btn" type="submit">Submit Request</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 <div id="app-layout" class="app-layout hidden">
 
     <!-- SIDEBAR -->
     <aside class="sidebar">
         <div class="sidebar-logo">
             <div class="logo-icon">H</div>
-            <span>HelpDesk</span>
+            <span class="sidebar-brand-text">HelpDesk</span>
         </div>
 
         <nav class="sidebar-nav" id="sidebar-nav">
@@ -59,12 +149,17 @@
         </nav>
 
         <div class="sidebar-footer">
+            <div class="sidebar-toggle-row">
+                <button class="sidebar-toggle" id="sidebar-toggle" data-tip="Minimize sidebar" aria-label="Minimize sidebar" type="button">&lt;&lt;</button>
+            </div>
+            <div class="sidebar-footer-actions">
             <div class="user-info" onclick="toggleUserMenu()">
                 <div class="user-avatar" id="user-avatar">—</div>
                 <div class="user-info-text">
                     <div class="user-name" id="user-name">Loading...</div>
                     <div class="user-role" id="user-role"></div>
                 </div>
+            </div>
             </div>
             <div id="user-menu" class="hidden" style="margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;">
                 <button onclick="openProfileSettings()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--text-primary);cursor:pointer;font-family:inherit;">⚙ Profile Settings</button>

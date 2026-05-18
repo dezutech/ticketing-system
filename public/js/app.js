@@ -26,11 +26,19 @@ let notificationPollTimer = null;
 let lastUnreadNotificationCount = 0;
 let lastSeenNotificationId = 0;
 let lastNotificationSoundAt = 0;
+let passwordResetLookupToken = null;
+let passwordResetVerifiedToken = null;
 
 // ─── INIT ───
 document.addEventListener('DOMContentLoaded', async () => {
     applyTheme(localStorage.getItem('color-theme') || localStorage.getItem('theme') || 'light');
     applyUiTheme(localStorage.getItem('ui-theme') || 'modern');
+    applySidebarState(localStorage.getItem('sidebar-state') || 'expanded');
+    setupSidebarTooltips();
+    if (window.location.pathname === '/self-service') {
+        showSelfServicePortal(false);
+        return;
+    }
     await checkAuth();
 });
 
@@ -70,21 +78,175 @@ function applyUiTheme(theme) {
     localStorage.setItem('ui-theme', normalized);
 }
 
+function applySidebarState(state) {
+    const minimized = state === 'minimized';
+    const layout = document.getElementById('app-layout');
+    const toggle = document.getElementById('sidebar-toggle');
+    document.body.classList.toggle('sidebar-minimized', minimized);
+    if (layout) layout.classList.toggle('sidebar-minimized', minimized);
+    if (toggle) {
+        toggle.innerHTML = minimized ? '&gt;&gt;' : '&lt;&lt;';
+        toggle.setAttribute('aria-label', minimized ? 'Expand sidebar' : 'Minimize sidebar');
+        toggle.dataset.tip = minimized ? 'Expand sidebar' : 'Minimize sidebar';
+    }
+    hideSidebarTooltip();
+    localStorage.setItem('sidebar-state', minimized ? 'minimized' : 'expanded');
+}
+
+function toggleSidebar() {
+    const minimized = document.body.classList.contains('sidebar-minimized');
+    applySidebarState(minimized ? 'expanded' : 'minimized');
+}
+
+window.toggleSidebar = toggleSidebar;
+
+function setupSidebarToggle() {
+    const toggle = document.getElementById('sidebar-toggle');
+    if (!toggle || toggle.dataset.bound === 'true') return;
+    toggle.dataset.bound = 'true';
+    toggle.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleSidebar();
+    });
+}
+
+let sidebarTooltipEl = null;
+let sidebarTooltipTarget = null;
+
+function getSidebarTooltipTarget(target) {
+    if (!document.body.classList.contains('sidebar-minimized')) return null;
+    const candidate = target.closest?.('.sidebar .nav-item[data-tip], .sidebar .user-info[data-tip], .sidebar .sidebar-toggle[data-tip]');
+    return candidate || null;
+}
+
+function ensureSidebarTooltip() {
+    if (!sidebarTooltipEl) {
+        sidebarTooltipEl = document.createElement('div');
+        sidebarTooltipEl.className = 'sidebar-floating-tooltip';
+        sidebarTooltipEl.setAttribute('role', 'tooltip');
+        document.body.appendChild(sidebarTooltipEl);
+    }
+    return sidebarTooltipEl;
+}
+
+function positionSidebarTooltip(target) {
+    if (!sidebarTooltipEl || !target) return;
+    const rect = target.getBoundingClientRect();
+    const tooltipRect = sidebarTooltipEl.getBoundingClientRect();
+    const gap = 12;
+    const viewportPadding = 8;
+    const left = Math.min(
+        rect.right + gap,
+        window.innerWidth - tooltipRect.width - viewportPadding
+    );
+    const top = Math.max(
+        viewportPadding,
+        Math.min(
+            rect.top + (rect.height - tooltipRect.height) / 2,
+            window.innerHeight - tooltipRect.height - viewportPadding
+        )
+    );
+
+    sidebarTooltipEl.style.left = `${Math.max(viewportPadding, left)}px`;
+    sidebarTooltipEl.style.top = `${top}px`;
+}
+
+function showSidebarTooltip(target) {
+    const text = target?.dataset?.tip?.trim();
+    if (!text) return;
+    sidebarTooltipTarget = target;
+    const tooltip = ensureSidebarTooltip();
+    tooltip.textContent = text;
+    tooltip.classList.add('visible');
+    positionSidebarTooltip(target);
+}
+
+function hideSidebarTooltip(target = null) {
+    if (target && target !== sidebarTooltipTarget) return;
+    sidebarTooltipTarget = null;
+    if (sidebarTooltipEl) sidebarTooltipEl.classList.remove('visible');
+}
+
+function setupSidebarTooltips() {
+    if (document.body.dataset.sidebarTooltipsBound === 'true') return;
+    document.body.dataset.sidebarTooltipsBound = 'true';
+
+    document.addEventListener('mouseover', event => {
+        const target = getSidebarTooltipTarget(event.target);
+        if (!target) return;
+        showSidebarTooltip(target);
+    });
+    document.addEventListener('mouseout', event => {
+        const target = getSidebarTooltipTarget(event.target);
+        if (!target || target.contains(event.relatedTarget)) return;
+        hideSidebarTooltip(target);
+    });
+    document.addEventListener('focusin', event => {
+        const target = getSidebarTooltipTarget(event.target);
+        if (target) showSidebarTooltip(target);
+    });
+    document.addEventListener('focusout', event => {
+        const target = getSidebarTooltipTarget(event.target);
+        if (target) hideSidebarTooltip(target);
+    });
+    window.addEventListener('resize', () => positionSidebarTooltip(sidebarTooltipTarget));
+    window.addEventListener('scroll', () => hideSidebarTooltip(), true);
+}
+
 // ─── AUTH ───
 function showLogin() {
+    document.getElementById('self-service-page')?.classList.add('hidden');
     document.getElementById('login-page').classList.remove('hidden');
     document.getElementById('app-layout').classList.add('hidden');
     resetLoginButton();
 }
 
 function showApp() {
+    document.getElementById('self-service-page')?.classList.add('hidden');
     document.getElementById('login-page').classList.add('hidden');
     document.getElementById('app-layout').classList.remove('hidden');
+    setupSidebarToggle();
+    applySidebarState(localStorage.getItem('sidebar-state') || 'expanded');
     renderUserInfo();
     setupNav();
     startNotificationPolling();
     navigateTo('dashboard');
 }
+
+function showSelfServicePortal(updateUrl = true) {
+    document.getElementById('login-page')?.classList.add('hidden');
+    document.getElementById('app-layout')?.classList.add('hidden');
+    document.getElementById('self-service-page')?.classList.remove('hidden');
+    resetPasswordResetFlow();
+    if (updateUrl && window.location.pathname !== '/self-service') {
+        history.pushState({}, '', '/self-service');
+    }
+}
+
+function openSelfServicePortal() {
+    showSelfServicePortal();
+}
+
+function returnToLogin() {
+    closeModal('password-reset-confirmation');
+    resetPasswordResetFlow();
+    history.pushState({}, '', '/');
+    showLogin();
+}
+
+window.openSelfServicePortal = openSelfServicePortal;
+window.returnToLogin = returnToLogin;
+
+window.addEventListener('popstate', () => {
+    if (window.location.pathname === '/self-service') {
+        showSelfServicePortal(false);
+    } else if (currentUser) {
+        showApp();
+    } else {
+        showLogin();
+    }
+});
 
 function resetLoginButton() {
     const btn = document.getElementById('login-btn');
@@ -121,6 +283,151 @@ async function handleLogin(e) {
         resetLoginButton();
     }
 }
+
+function setPasswordResetStep(step) {
+    document.getElementById('password-reset-find-form')?.classList.toggle('hidden', step !== 1);
+    document.getElementById('password-reset-phone-form')?.classList.toggle('hidden', step !== 2);
+    document.getElementById('password-reset-request-form')?.classList.toggle('hidden', step !== 3);
+    [1, 2, 3].forEach(num => {
+        document.getElementById(`pr-step-dot-${num}`)?.classList.toggle('active', num === step);
+        document.getElementById(`pr-step-dot-${num}`)?.classList.toggle('complete', num < step);
+    });
+}
+
+function resetPasswordResetFlow() {
+    passwordResetLookupToken = null;
+    passwordResetVerifiedToken = null;
+    document.getElementById('self-service-alert').innerHTML = '';
+    document.getElementById('password-reset-find-form')?.reset();
+    document.getElementById('password-reset-phone-form')?.reset();
+    document.getElementById('password-reset-request-form')?.reset();
+    setPasswordResetStep(1);
+}
+
+async function submitPasswordResetFindAccount(e) {
+    e.preventDefault();
+    const btn = document.getElementById('password-reset-find-btn');
+    const alertEl = document.getElementById('self-service-alert');
+    const identifier = document.getElementById('pr-account-identifier').value.trim();
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Searching...';
+    alertEl.innerHTML = '';
+
+    try {
+        const data = await API.post('/tickets/password-reset/find-account', { identifier });
+        if (data.success) {
+            passwordResetLookupToken = data.lookup_token;
+            document.getElementById('pr-found-name').textContent = data.display_name;
+            document.getElementById('pr-masked-phone').textContent = data.masked_phone;
+            setPasswordResetStep(2);
+        } else {
+            alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'No user or email found.')}</div>`;
+        }
+    } catch (error) {
+        alertEl.innerHTML = '<div class="alert alert-error">Unable to search account. Please try again.</div>';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Search';
+    }
+}
+
+async function submitPasswordResetVerifyPhone(e) {
+    e.preventDefault();
+    const btn = document.getElementById('password-reset-verify-btn');
+    const alertEl = document.getElementById('self-service-alert');
+    const phone = document.getElementById('pr-phone-verify').value.trim();
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Verifying...';
+    alertEl.innerHTML = '';
+
+    try {
+        const data = await API.post('/tickets/password-reset/verify-phone', {
+            lookup_token: passwordResetLookupToken,
+            phone
+        });
+        if (data.success) {
+            passwordResetVerifiedToken = data.verified_token;
+            document.getElementById('pr-full-name').value = data.user.full_name || '';
+            document.getElementById('pr-username-email').value = data.user.username_or_email || '';
+            document.getElementById('pr-department').value = data.user.department || '';
+            document.getElementById('pr-branch').value = data.user.branch || '';
+            document.getElementById('pr-contact').value = data.user.contact_number || '';
+            setPasswordResetStep(3);
+        } else {
+            alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Phone number does not match our records.')}</div>`;
+        }
+    } catch (error) {
+        alertEl.innerHTML = '<div class="alert alert-error">Phone number does not match our records.</div>';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Continue';
+    }
+}
+
+async function submitPasswordResetRequest(e) {
+    e.preventDefault();
+    const btn = document.getElementById('password-reset-submit-btn');
+    const alertEl = document.getElementById('self-service-alert');
+    const body = {
+        verified_token: passwordResetVerifiedToken,
+        account_system: document.getElementById('pr-system').value.trim(),
+        reason: document.getElementById('pr-reason').value.trim(),
+        additional_notes: document.getElementById('pr-notes').value.trim()
+    };
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Submitting...';
+    alertEl.innerHTML = '';
+
+    try {
+        const data = await API.post('/tickets/password-reset-request', body);
+        if (data.success) {
+            resetPasswordResetFlow();
+            showPasswordResetConfirmation(data.ticket_number);
+        } else {
+            alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to submit request.')}</div>`;
+        }
+    } catch (error) {
+        alertEl.innerHTML = '<div class="alert alert-error">Unable to submit request. Please try again.</div>';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Submit Request';
+    }
+}
+
+function showPasswordResetConfirmation(ticketNumber) {
+    closeModal('password-reset-confirmation');
+    const html = `
+        <div class="modal-overlay active" id="password-reset-confirmation">
+            <div class="modal" style="max-width:480px;">
+                <div class="modal-header">
+                    <span class="modal-title">Request Submitted</span>
+                    <button class="modal-close" onclick="closeModal('password-reset-confirmation')">×</button>
+                </div>
+                <div class="modal-body">
+                    <div class="alert alert-success" style="margin-bottom:16px;">
+                        Ticket <strong>${escHtml(ticketNumber)}</strong> has been created.
+                    </div>
+                    <p style="color:var(--text-secondary);font-size:13.5px;line-height:1.7;">
+                        A support team member will verify your identity before any password reset is performed.
+                    </p>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="returnToLogin()">Back to Login</button>
+                    <button class="btn btn-primary" onclick="closeModal('password-reset-confirmation')">Create Another Request</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', html);
+}
+
+window.resetPasswordResetFlow = resetPasswordResetFlow;
+window.submitPasswordResetFindAccount = submitPasswordResetFindAccount;
+window.submitPasswordResetVerifyPhone = submitPasswordResetVerifyPhone;
+window.submitPasswordResetRequest = submitPasswordResetRequest;
 
 async function handleLogout() {
     await API.post('/auth/logout');
@@ -277,9 +584,10 @@ function setupNav() {
         .map(i => `
             <div class="nav-item" data-page="${i.id}" onclick="navigateTo('${i.id}')">
                 <span class="nav-icon">${i.icon}</span>
-                <span>${i.label}</span>
+                <span class="nav-text">${i.label}</span>
             </div>
         `).join('');
+    updateSidebarTooltips();
 }
 
 function renderUserInfo() {
@@ -287,6 +595,14 @@ function renderUserInfo() {
     document.getElementById('user-avatar').textContent = initials;
     document.getElementById('user-name').textContent = currentUser.full_name;
     document.getElementById('user-role').textContent = currentUser.role_name;
+    document.querySelector('.user-info')?.setAttribute('data-tip', `${currentUser.full_name} - ${currentUser.role_name}`);
+}
+
+function updateSidebarTooltips() {
+    document.querySelectorAll('#sidebar-nav .nav-item').forEach(item => {
+        const label = item.querySelector('.nav-text')?.textContent?.trim();
+        if (label) item.dataset.tip = label;
+    });
 }
 
 function openProfileSettings() {
@@ -432,8 +748,6 @@ function renderBackupHistory(backups) {
                 <tr>
                     <th>Backup File</th>
                     <th>Generated</th>
-                    <th>Tables</th>
-                    <th>Rows</th>
                     <th>Size</th>
                     <th>Created By</th>
                     <th>Action</th>
@@ -447,8 +761,6 @@ function renderBackupHistory(backups) {
                             ${backup.invalid ? '<div class="backup-warning">Invalid backup metadata</div>' : ''}
                         </td>
                         <td>${formatDate(backup.generated_at || backup.modified_at)}</td>
-                        <td>${backup.table_count ?? '-'}</td>
-                        <td>${backup.row_count ?? '-'}</td>
                         <td>${formatFileSize(backup.size || 0)}</td>
                         <td>${escHtml(backup.generated_by?.user_name || '-')}</td>
                         <td>
@@ -1348,7 +1660,7 @@ async function openTicket(ticketId) {
 
                             <!-- DETAILS TAB -->
                             <div id="tab-detail">
-                                <p style="color:var(--text-secondary);font-size:13.5px;line-height:1.7;margin-bottom:20px;">${escHtml(t.description)}</p>
+                                <div class="ticket-description">${escHtml(t.description)}</div>
 
                                 ${attachments.length ? `
                                 <div style="margin-bottom:20px;">
@@ -2408,10 +2720,11 @@ setupNav = function() {
     const item = document.createElement('div');
     item.className = 'nav-item';
     item.dataset.page = 'assets';
+    item.dataset.tip = 'Assets';
     item.onclick = () => navigateTo('assets');
     item.innerHTML = `
         <span class="nav-icon">A</span>
-        <span>Assets</span>
+        <span class="nav-text">Assets</span>
     `;
 
     if (usersNav) nav.insertBefore(item, usersNav);

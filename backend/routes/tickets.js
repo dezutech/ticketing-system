@@ -7,10 +7,16 @@ const fs = require('fs');
 const { query, sql } = require('../config/database');
 const { authenticateToken, requirePermission } = require('../middleware/auth');
 const { logActivity } = require('../utils/activityLogger');
-const { notifyUsers, getAdminNotificationRecipients } = require('../utils/notificationService');
+const { notifyUsers, getAdminNotificationRecipients, getUsersByRoles } = require('../utils/notificationService');
 
 const TICKET_PRIORITIES = ['Urgent', 'High', 'Normal', 'Low'];
 const TICKET_STATUSES = ['Open', 'In Progress', 'Pending', 'Resolved', 'Closed'];
+const passwordResetLookups = new Map();
+const passwordResetVerifications = new Map();
+const passwordResetRateLimits = new Map();
+const PASSWORD_RESET_TOKEN_TTL = 10 * 60 * 1000;
+const PASSWORD_RESET_RATE_WINDOW = 15 * 60 * 1000;
+const PASSWORD_RESET_RATE_MAX = 8;
 
 // Multer config
 const storage = multer.diskStorage({
@@ -39,9 +45,34 @@ const upload = multer({
 // Helper: generate ticket number
 async function generateTicketNumber() {
     const year = new Date().getFullYear();
-    const result = await query(`SELECT COUNT(*) as cnt FROM Tickets WHERE YEAR(created_at) = ${year}`);
-    const count = result.recordset[0].cnt + 1;
+    const result = await query(`
+        SELECT MAX(TRY_CONVERT(INT, RIGHT(ticket_number, 4))) AS lastNumber
+        FROM Tickets
+        WHERE ticket_number LIKE @prefix
+    `, {
+        prefix: { type: sql.NVarChar, value: `TKT-${year}-%` }
+    });
+    const count = (result.recordset[0].lastNumber || 0) + 1;
     return `TKT-${year}-${String(count).padStart(4, '0')}`;
+}
+
+function isDuplicateTicketNumberError(err) {
+    return err?.number === 2627 && /UQ__Tickets|duplicate key/i.test(err?.message || '');
+}
+
+async function createTicketWithGeneratedNumber(insertTicket) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        const ticketNumber = await generateTicketNumber();
+        try {
+            const result = await insertTicket(ticketNumber);
+            return { ticketNumber, result };
+        } catch (err) {
+            if (!isDuplicateTicketNumberError(err)) throw err;
+            lastError = err;
+        }
+    }
+    throw lastError || new Error('Unable to generate a unique ticket number.');
 }
 
 function canManageAssets(user) {
@@ -72,6 +103,109 @@ function ticketLink(ticketId) {
 
 function ticketNotificationOptions(type, ticketId, title) {
     return { title, type, relatedTicketId: Number(ticketId) };
+}
+
+function cleanText(value, max = 4000) {
+    const text = String(value || '').trim();
+    return text.length > max ? text.slice(0, max) : text;
+}
+
+async function getOrCreatePasswordResetCategory() {
+    const existing = await query(`
+        SELECT TOP 1 category_id, category_name
+        FROM Categories
+        WHERE is_active = 1
+          AND LOWER(category_name) = 'account access'
+    `);
+    if (existing.recordset.length) return existing.recordset[0];
+
+    const created = await query(`
+        INSERT INTO Categories (category_name, description, is_active)
+        OUTPUT INSERTED.category_id, INSERTED.category_name
+        VALUES ('Account Access', 'Self-service account access and password reset requests', 1)
+    `);
+    return created.recordset[0];
+}
+
+function buildPasswordResetDescription(body) {
+    const rows = [
+        ['Full Name', cleanText(body.full_name, 150)],
+        ['Username/Email', cleanText(body.username_or_email, 150)],
+        ['Department', cleanText(body.department, 120)],
+        ['Branch', cleanText(body.branch, 120)],
+        ['Contact Number', cleanText(body.contact_number, 60)],
+        ['Account/System', cleanText(body.account_system, 150)],
+        ['Reason', cleanText(body.reason, 1000)],
+        ['Additional Notes', cleanText(body.additional_notes, 2000) || 'None provided']
+    ];
+
+    return [
+        'Self-Service Password Reset Request',
+        '',
+        ...rows.map(([label, value]) => `${label}: ${value || 'Not provided'}`),
+        '',
+        'Security note: This ticket records the request only. Passwords must be verified and reset manually by authorized support staff.'
+    ].join('\n');
+}
+
+function randomToken() {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function cleanupPasswordResetTokens() {
+    const now = Date.now();
+    for (const [token, data] of passwordResetLookups) {
+        if (data.expiresAt <= now) passwordResetLookups.delete(token);
+    }
+    for (const [token, data] of passwordResetVerifications) {
+        if (data.expiresAt <= now) passwordResetVerifications.delete(token);
+    }
+}
+
+function rateLimitPasswordReset(key) {
+    const now = Date.now();
+    const current = passwordResetRateLimits.get(key);
+    if (!current || current.resetAt <= now) {
+        passwordResetRateLimits.set(key, { count: 1, resetAt: now + PASSWORD_RESET_RATE_WINDOW });
+        return false;
+    }
+    current.count += 1;
+    return current.count > PASSWORD_RESET_RATE_MAX;
+}
+
+function normalizePhone(value) {
+    return String(value || '').replace(/\D/g, '').replace(/^0/, '63');
+}
+
+function maskPhone(value) {
+    const digits = normalizePhone(value);
+    const last4 = digits.slice(-4).padStart(4, '*');
+    return `+63 ***** ${last4}`;
+}
+
+async function findPasswordResetUser(identifier) {
+    const lookup = cleanText(identifier, 150);
+    if (!lookup) return null;
+    const numericId = Number.parseInt(lookup, 10);
+    const inputs = {
+        lookup: { type: sql.NVarChar, value: lookup }
+    };
+    if (Number.isInteger(numericId) && String(numericId) === lookup) {
+        inputs.userId = { type: sql.Int, value: numericId };
+    }
+    const result = await query(`
+        SELECT TOP 1 u.user_id, u.username, u.email, u.full_name, u.department, u.phone, u.branch, r.role_name
+        FROM Users u
+        JOIN Roles r ON u.role_id = r.role_id
+        WHERE u.is_active = 1
+          AND (
+              LOWER(u.username) = LOWER(@lookup)
+              OR LOWER(u.email) = LOWER(@lookup)
+              ${inputs.userId ? 'OR u.user_id = @userId' : ''}
+          )
+        ORDER BY u.user_id
+    `, inputs);
+    return result.recordset[0] || null;
 }
 
 async function linkTicketAsset(ticketId, assetId, user) {
@@ -274,6 +408,212 @@ router.get('/attachment/:id/download', authenticateToken, async (req, res) => {
     }
 });
 
+// POST /api/tickets/password-reset/find-account - public account lookup
+router.post('/password-reset/find-account', async (req, res) => {
+    try {
+        cleanupPasswordResetTokens();
+        const rateKey = `find:${req.ip}`;
+        if (rateLimitPasswordReset(rateKey)) {
+            return res.status(429).json({ success: false, message: 'Too many attempts. Please try again later.' });
+        }
+
+        const identifier = cleanText(req.body.identifier, 150);
+        if (!identifier) return res.status(400).json({ success: false, message: 'Please enter your Employee ID, username, or email.' });
+
+        const user = await findPasswordResetUser(identifier);
+        if (!user || !cleanText(user.phone, 60)) {
+            return res.json({ success: false, message: 'No user or email found.' });
+        }
+
+        const lookupToken = randomToken();
+        passwordResetLookups.set(lookupToken, {
+            userId: user.user_id,
+            attempts: 0,
+            expiresAt: Date.now() + PASSWORD_RESET_TOKEN_TTL
+        });
+
+        res.json({
+            success: true,
+            lookup_token: lookupToken,
+            display_name: user.full_name || user.username,
+            masked_phone: maskPhone(user.phone)
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// POST /api/tickets/password-reset/verify-phone - verify registered phone number
+router.post('/password-reset/verify-phone', async (req, res) => {
+    try {
+        cleanupPasswordResetTokens();
+        const lookupToken = cleanText(req.body.lookup_token, 200);
+        const phone = cleanText(req.body.phone, 60);
+        const lookup = passwordResetLookups.get(lookupToken);
+        if (!lookup) {
+            return res.status(400).json({ success: false, message: 'Verification expired. Please search again.' });
+        }
+        if (lookup.attempts >= 3) {
+            passwordResetLookups.delete(lookupToken);
+            return res.status(429).json({ success: false, message: 'Too many attempts. Please search again later.' });
+        }
+
+        const result = await query(`
+            SELECT TOP 1 user_id, username, email, full_name, department, phone, branch
+            FROM Users
+            WHERE user_id = @userId AND is_active = 1
+        `, {
+            userId: { type: sql.Int, value: lookup.userId }
+        });
+        const user = result.recordset[0];
+        if (!user) {
+            passwordResetLookups.delete(lookupToken);
+            return res.status(400).json({ success: false, message: 'Verification expired. Please search again.' });
+        }
+
+        if (normalizePhone(phone) !== normalizePhone(user.phone)) {
+            lookup.attempts += 1;
+            return res.status(400).json({ success: false, message: 'Phone number does not match our records.' });
+        }
+
+        passwordResetLookups.delete(lookupToken);
+        const verifiedToken = randomToken();
+        passwordResetVerifications.set(verifiedToken, {
+            userId: user.user_id,
+            expiresAt: Date.now() + PASSWORD_RESET_TOKEN_TTL
+        });
+
+        res.json({
+            success: true,
+            verified_token: verifiedToken,
+            user: {
+                full_name: user.full_name || user.username,
+                username_or_email: user.email || user.username,
+                department: user.department || '',
+                branch: user.branch || '',
+                contact_number: user.phone || ''
+            }
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// POST /api/tickets/password-reset-request - create verified self-service request
+router.post('/password-reset-request', async (req, res) => {
+    try {
+        cleanupPasswordResetTokens();
+        const verifiedToken = cleanText(req.body.verified_token, 200);
+        const verified = passwordResetVerifications.get(verifiedToken);
+        if (!verified) {
+            return res.status(400).json({ success: false, message: 'Phone verification is required before submitting a request.' });
+        }
+
+        const accountSystem = cleanText(req.body.account_system, 150);
+        const reason = cleanText(req.body.reason, 1000);
+        const additionalNotes = cleanText(req.body.additional_notes, 2000);
+        if (!accountSystem || !reason) {
+            return res.status(400).json({ success: false, message: 'Please complete all required fields.' });
+        }
+
+        const [category, userResult] = await Promise.all([
+            getOrCreatePasswordResetCategory(),
+            query(`
+                SELECT TOP 1 u.user_id, u.username, u.email, u.full_name, u.department, u.phone, u.branch, r.role_name
+                FROM Users u
+                JOIN Roles r ON u.role_id = r.role_id
+                WHERE u.user_id = @userId AND u.is_active = 1
+            `, {
+                userId: { type: sql.Int, value: verified.userId }
+            })
+        ]);
+        const creator = userResult.recordset[0];
+        if (!creator) {
+            passwordResetVerifications.delete(verifiedToken);
+            return res.status(400).json({ success: false, message: 'Verified user is no longer available.' });
+        }
+
+        const fullName = creator.full_name || creator.username;
+        const usernameOrEmail = creator.email || creator.username;
+        const department = creator.department || '';
+        const branch = creator.branch || '';
+        const contactNumber = creator.phone || '';
+        const title = `Password Reset Request - ${fullName}`;
+        const description = buildPasswordResetDescription({
+            full_name: fullName,
+            username_or_email: usernameOrEmail,
+            department,
+            branch,
+            contact_number: contactNumber,
+            account_system: accountSystem,
+            reason,
+            additional_notes: additionalNotes
+        });
+
+        const { ticketNumber, result } = await createTicketWithGeneratedNumber(ticketNumber => query(`
+                INSERT INTO Tickets (ticket_number, title, description, category_id, priority, department, created_by, status)
+                OUTPUT INSERTED.ticket_id
+                VALUES (@num, @title, @desc, @cat, 'Normal', @dept, @createdBy, 'Open')
+            `, {
+                num: { type: sql.NVarChar, value: ticketNumber },
+                title: { type: sql.NVarChar, value: title },
+                desc: { type: sql.NVarChar, value: description },
+                cat: { type: sql.Int, value: category.category_id },
+                dept: { type: sql.NVarChar, value: department },
+                createdBy: { type: sql.Int, value: creator.user_id }
+            })
+        );
+
+        const ticketId = result.recordset[0].ticket_id;
+
+        await query(`
+            INSERT INTO TicketHistory (ticket_id, changed_by, field_changed, old_value, new_value)
+            VALUES (@tid, @uid, 'status', NULL, 'Open')
+        `, {
+            tid: { type: sql.Int, value: ticketId },
+            uid: { type: sql.Int, value: creator.user_id }
+        });
+
+        await logActivity(
+            creator,
+            'Password reset request created',
+            'Tickets',
+            ticketId,
+            {
+                ticket_number: ticketNumber,
+                category: category.category_name,
+                department,
+                branch,
+                account_system: accountSystem,
+                created_by_user_id: creator.user_id
+            }
+        );
+
+        const recipients = (await getUsersByRoles(['Super Admin', 'Admin', 'Staff'])).map(user => user.user_id);
+        await notifyUsers(
+            recipients,
+            `Self-service password reset request: ${ticketNumber} - ${fullName}`,
+            'Tickets',
+            ticketId,
+            ticketLink(ticketId),
+            ticketNotificationOptions('password_reset_request', ticketId, 'Password reset request')
+        );
+        passwordResetVerifications.delete(verifiedToken);
+
+        res.json({
+            success: true,
+            message: 'Password reset request created.',
+            ticket_id: ticketId,
+            ticket_number: ticketNumber
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
 // GET /api/tickets/:id
 router.get('/:id', authenticateToken, async (req, res) => {
     try {
@@ -351,22 +691,21 @@ router.post('/', authenticateToken, upload.array('attachments', 5), async (req, 
             return res.status(400).json({ success: false, message: 'Invalid ticket priority.' });
         }
 
-        const ticketNumber = await generateTicketNumber();
-
-        const result = await query(`
-            INSERT INTO Tickets (ticket_number, title, description, category_id, priority, department, due_date, created_by, status)
-            OUTPUT INSERTED.ticket_id
-            VALUES (@num, @title, @desc, @cat, @priority, @dept, @due, @createdBy, 'Open')
-        `, {
-            num: { type: sql.NVarChar, value: ticketNumber },
-            title: { type: sql.NVarChar, value: title },
-            desc: { type: sql.NVarChar, value: description },
-            cat: { type: sql.Int, value: category_id || null },
-            priority: { type: sql.NVarChar, value: priority || 'Normal' },
-            dept: { type: sql.NVarChar, value: department || req.user.department },
-            due: { type: sql.DateTime, value: due_date || null },
-            createdBy: { type: sql.Int, value: req.user.user_id }
-        });
+        const { ticketNumber, result } = await createTicketWithGeneratedNumber(ticketNumber => query(`
+                INSERT INTO Tickets (ticket_number, title, description, category_id, priority, department, due_date, created_by, status)
+                OUTPUT INSERTED.ticket_id
+                VALUES (@num, @title, @desc, @cat, @priority, @dept, @due, @createdBy, 'Open')
+            `, {
+                num: { type: sql.NVarChar, value: ticketNumber },
+                title: { type: sql.NVarChar, value: title },
+                desc: { type: sql.NVarChar, value: description },
+                cat: { type: sql.Int, value: category_id || null },
+                priority: { type: sql.NVarChar, value: priority || 'Normal' },
+                dept: { type: sql.NVarChar, value: department || req.user.department },
+                due: { type: sql.DateTime, value: due_date || null },
+                createdBy: { type: sql.Int, value: req.user.user_id }
+            })
+        );
 
         const ticketId = result.recordset[0].ticket_id;
 
