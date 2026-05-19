@@ -4,6 +4,8 @@ const { query } = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
 
 const DASHBOARD_ROLES = ['Super Admin', 'Admin'];
+const SLA_ACK_TARGET_MINUTES = 4 * 60;
+const SLA_RESOLVE_TARGET_MINUTES = 72 * 60;
 
 function canViewDashboardAnalytics(user) {
     return DASHBOARD_ROLES.includes(user?.role_name);
@@ -39,6 +41,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
     try {
         const [
             ticketSummary,
+            ticketKpis,
             ticketsByStatus,
             ticketsByPriority,
             ticketsPerMonth,
@@ -59,6 +62,27 @@ router.get('/stats', authenticateToken, async (req, res) => {
                     SUM(CASE WHEN status = 'Resolved' THEN 1 ELSE 0 END) AS resolved,
                     SUM(CASE WHEN status = 'Closed' THEN 1 ELSE 0 END) AS closed,
                     SUM(CASE WHEN priority IN ('Urgent', 'Critical') AND status NOT IN ('Resolved', 'Closed') THEN 1 ELSE 0 END) AS urgent_open
+                FROM Tickets
+            `),
+            query(`
+                SELECT
+                    AVG(CASE
+                        WHEN acknowledged_at IS NOT NULL
+                        THEN CAST(DATEDIFF(MINUTE, created_at, acknowledged_at) AS FLOAT)
+                    END) AS avg_acknowledgement_minutes,
+                    AVG(CASE
+                        WHEN resolved_at IS NOT NULL
+                        THEN CAST(DATEDIFF(MINUTE, created_at, resolved_at) AS FLOAT)
+                    END) AS avg_resolution_minutes,
+                    SUM(CASE WHEN status IN ('Resolved', 'Closed') THEN 1 ELSE 0 END) AS total_resolved_tickets,
+                    SUM(CASE
+                        WHEN status NOT IN ('Resolved', 'Closed')
+                            AND (
+                                GETDATE() > COALESCE(due_date, DATEADD(MINUTE, ${SLA_RESOLVE_TARGET_MINUTES}, created_at))
+                                OR (acknowledged_at IS NULL AND GETDATE() > DATEADD(MINUTE, ${SLA_ACK_TARGET_MINUTES}, created_at))
+                            )
+                        THEN 1 ELSE 0
+                    END) AS overdue_tickets
                 FROM Tickets
             `),
             query(`
@@ -185,6 +209,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
         ]);
 
         const tickets = ticketSummary.recordset[0] || {};
+        const kpis = ticketKpis.recordset[0] || {};
         const assets = assetSummary[0] || {};
         res.json({
             success: true,
@@ -196,6 +221,12 @@ router.get('/stats', authenticateToken, async (req, res) => {
                 resolved: tickets.resolved || 0,
                 closed: tickets.closed || 0,
                 urgentOpen: tickets.urgent_open || 0
+            },
+            ticketKpis: {
+                avgAcknowledgementMinutes: kpis.avg_acknowledgement_minutes,
+                avgResolutionMinutes: kpis.avg_resolution_minutes,
+                totalResolvedTickets: kpis.total_resolved_tickets || 0,
+                overdueTickets: kpis.overdue_tickets || 0
             },
             ticketsByStatus: ticketsByStatus.recordset || [],
             ticketsByPriority: ticketsByPriority.recordset || [],

@@ -11,6 +11,11 @@ const { notifyUsers, getAdminNotificationRecipients, getUsersByRoles } = require
 
 const TICKET_PRIORITIES = ['Urgent', 'High', 'Normal', 'Low'];
 const TICKET_STATUSES = ['Open', 'In Progress', 'Pending', 'Resolved', 'Closed'];
+const ACKNOWLEDGED_STATUSES = ['In Progress', 'Pending', 'Resolved', 'Closed'];
+const RESOLVED_STATUSES = ['Resolved', 'Closed'];
+const SLA_ACK_TARGET_MINUTES = 4 * 60;
+const SLA_RESOLVE_TARGET_MINUTES = 72 * 60;
+const SLA_WARNING_RATIO = 0.8;
 const passwordResetLookups = new Map();
 const passwordResetVerifications = new Map();
 const passwordResetRateLimits = new Map();
@@ -342,7 +347,22 @@ router.get('/', authenticateToken, async (req, res) => {
             SELECT TOP ${limit} * FROM (
                 SELECT ROW_NUMBER() OVER (ORDER BY t.created_at DESC) AS rn,
                     t.ticket_id, t.ticket_number, t.title, t.priority, t.status,
-                    t.created_at, t.updated_at, t.resolved_at, t.due_date,
+                    t.created_at, t.updated_at, t.acknowledged_at, t.resolved_at, t.due_date,
+                    CASE WHEN t.acknowledged_at IS NOT NULL THEN DATEDIFF(MINUTE, t.created_at, t.acknowledged_at) END AS time_to_acknowledge_minutes,
+                    CASE WHEN t.resolved_at IS NOT NULL THEN DATEDIFF(MINUTE, t.created_at, t.resolved_at) END AS time_to_resolve_minutes,
+                    CASE
+                        WHEN t.acknowledged_at IS NULL AND GETDATE() > DATEADD(MINUTE, ${SLA_ACK_TARGET_MINUTES}, t.created_at) THEN 'Overdue'
+                        WHEN t.acknowledged_at IS NOT NULL AND DATEDIFF(MINUTE, t.created_at, t.acknowledged_at) > ${SLA_ACK_TARGET_MINUTES} THEN 'Overdue'
+                        WHEN t.status IN ('Resolved', 'Closed') THEN
+                            CASE
+                                WHEN t.resolved_at <= COALESCE(t.due_date, DATEADD(MINUTE, ${SLA_RESOLVE_TARGET_MINUTES}, t.created_at)) THEN 'On Time'
+                                ELSE 'Overdue'
+                            END
+                        WHEN GETDATE() > COALESCE(t.due_date, DATEADD(MINUTE, ${SLA_RESOLVE_TARGET_MINUTES}, t.created_at)) THEN 'Overdue'
+                        WHEN t.acknowledged_at IS NULL AND GETDATE() >= DATEADD(MINUTE, CAST(${SLA_ACK_TARGET_MINUTES * SLA_WARNING_RATIO} AS INT), t.created_at) THEN 'Warning'
+                        WHEN GETDATE() >= DATEADD(MINUTE, CAST(DATEDIFF(MINUTE, t.created_at, COALESCE(t.due_date, DATEADD(MINUTE, ${SLA_RESOLVE_TARGET_MINUTES}, t.created_at))) * ${SLA_WARNING_RATIO} AS INT), t.created_at) THEN 'Warning'
+                        ELSE 'On Time'
+                    END AS sla_status,
                     c.category_name,
                     creator.full_name AS created_by_name,
                     assignee.full_name AS assigned_to_name,
@@ -619,6 +639,21 @@ router.get('/:id', authenticateToken, async (req, res) => {
     try {
         const result = await query(`
             SELECT t.*, c.category_name,
+                CASE WHEN t.acknowledged_at IS NOT NULL THEN DATEDIFF(MINUTE, t.created_at, t.acknowledged_at) END AS time_to_acknowledge_minutes,
+                CASE WHEN t.resolved_at IS NOT NULL THEN DATEDIFF(MINUTE, t.created_at, t.resolved_at) END AS time_to_resolve_minutes,
+                CASE
+                    WHEN t.acknowledged_at IS NULL AND GETDATE() > DATEADD(MINUTE, ${SLA_ACK_TARGET_MINUTES}, t.created_at) THEN 'Overdue'
+                    WHEN t.acknowledged_at IS NOT NULL AND DATEDIFF(MINUTE, t.created_at, t.acknowledged_at) > ${SLA_ACK_TARGET_MINUTES} THEN 'Overdue'
+                    WHEN t.status IN ('Resolved', 'Closed') THEN
+                        CASE
+                            WHEN t.resolved_at <= COALESCE(t.due_date, DATEADD(MINUTE, ${SLA_RESOLVE_TARGET_MINUTES}, t.created_at)) THEN 'On Time'
+                            ELSE 'Overdue'
+                        END
+                    WHEN GETDATE() > COALESCE(t.due_date, DATEADD(MINUTE, ${SLA_RESOLVE_TARGET_MINUTES}, t.created_at)) THEN 'Overdue'
+                    WHEN t.acknowledged_at IS NULL AND GETDATE() >= DATEADD(MINUTE, CAST(${SLA_ACK_TARGET_MINUTES * SLA_WARNING_RATIO} AS INT), t.created_at) THEN 'Warning'
+                    WHEN GETDATE() >= DATEADD(MINUTE, CAST(DATEDIFF(MINUTE, t.created_at, COALESCE(t.due_date, DATEADD(MINUTE, ${SLA_RESOLVE_TARGET_MINUTES}, t.created_at))) * ${SLA_WARNING_RATIO} AS INT), t.created_at) THEN 'Warning'
+                    ELSE 'On Time'
+                END AS sla_status,
                 creator.full_name AS created_by_name, creator.email AS created_by_email,
                 assignee.full_name AS assigned_to_name, assignee.email AS assigned_to_email, assignee.user_id AS assigned_to_id
             FROM Tickets t
@@ -789,7 +824,12 @@ router.patch('/:id', authenticateToken, async (req, res) => {
         if (status) {
             updates.push('status = @status');
             inputs.status = { type: sql.NVarChar, value: status };
-            if (status === 'Resolved') { updates.push('resolved_at = GETDATE()'); }
+            if (ACKNOWLEDGED_STATUSES.includes(status) && !ticket.acknowledged_at) {
+                updates.push('acknowledged_at = GETDATE()');
+            }
+            if (RESOLVED_STATUSES.includes(status) && !ticket.resolved_at) {
+                updates.push('resolved_at = GETDATE()');
+            }
             await query(`INSERT INTO TicketHistory (ticket_id, changed_by, field_changed, old_value, new_value) VALUES (@id, @uid, 'status', @old, @new)`,
                 { id: { type: sql.Int, value: ticketId }, uid: { type: sql.Int, value: req.user.user_id }, old: { type: sql.NVarChar, value: ticket.status }, new: { type: sql.NVarChar, value: status } });
             await logActivity(req.user, 'Ticket status changed', 'Tickets', ticketId, {

@@ -56,7 +56,8 @@ router.post('/login', async (req, res) => {
             can_view_all_tickets: user.can_view_all_tickets,
             can_manage_roles: user.can_manage_roles,
             must_change_password: user.must_change_password ? true : false,
-            theme_preference: user.theme_preference || 'modern'
+            theme_preference: user.theme_preference || 'modern',
+            night_mode_enabled: !!user.night_mode_enabled
         };
 
         const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '8h' });
@@ -98,18 +99,31 @@ router.get('/me', authenticateToken, (req, res) => {
 // PATCH /api/auth/theme
 router.patch('/theme', authenticateToken, async (req, res) => {
     try {
-        const { theme_preference } = req.body;
+        const { theme_preference, night_mode_enabled } = req.body;
         if (!THEME_PREFERENCES.includes(theme_preference)) {
             return res.status(400).json({ success: false, message: 'Invalid theme selected.' });
         }
 
         await ensureUserThemeColumn();
-        await query(`UPDATE Users SET theme_preference = @theme, updated_at = GETDATE() WHERE user_id = @id`, {
+        const nightModeEnabled = night_mode_enabled ? 1 : 0;
+        await query(`
+            UPDATE Users
+            SET theme_preference = @theme,
+                night_mode_enabled = @nightMode,
+                updated_at = GETDATE()
+            WHERE user_id = @id
+        `, {
             theme: { type: sql.NVarChar, value: theme_preference },
+            nightMode: { type: sql.Bit, value: nightModeEnabled },
             id: { type: sql.Int, value: req.user.user_id }
         });
 
-        res.json({ success: true, message: 'Theme updated.', theme_preference });
+        res.json({
+            success: true,
+            message: 'Theme updated.',
+            theme_preference,
+            night_mode_enabled: !!nightModeEnabled
+        });
     } catch (err) {
         console.error(err);
         res.status(500).json({ success: false, message: 'Server error.' });

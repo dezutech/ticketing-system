@@ -31,8 +31,8 @@ let passwordResetVerifiedToken = null;
 
 // ─── INIT ───
 document.addEventListener('DOMContentLoaded', async () => {
-    applyTheme(localStorage.getItem('color-theme') || localStorage.getItem('theme') || 'light');
     applyUiTheme(localStorage.getItem('ui-theme') || 'modern');
+    applyNightMode(localStorage.getItem('night-mode') === 'true');
     applySidebarState(localStorage.getItem('sidebar-state') || 'expanded');
     setupSidebarTooltips();
     if (window.location.pathname === '/self-service') {
@@ -47,6 +47,7 @@ async function checkAuth() {
     if (data.success) {
         currentUser = data.user;
         applyUiTheme(currentUser.theme_preference || localStorage.getItem('ui-theme') || 'modern');
+        applyNightMode(!!currentUser.night_mode_enabled);
         showApp();
     } else {
         showLogin();
@@ -54,18 +55,9 @@ async function checkAuth() {
 }
 
 // ─── THEME ───
-function applyTheme(theme) {
-    document.documentElement.setAttribute('data-theme', theme);
-    localStorage.setItem('color-theme', theme);
-    const btn = document.getElementById('theme-toggle');
-    if (btn) btn.textContent = theme === 'dark' ? '☀️' : '🌙';
-    const sidebarBtn = document.getElementById('theme-toggle-sidebar');
-    if (sidebarBtn) sidebarBtn.textContent = theme === 'dark' ? '☀️ Light Mode' : '🌙 Dark Mode';
-}
-
 function toggleTheme() {
-    const current = document.documentElement.getAttribute('data-theme') || 'light';
-    applyTheme(current === 'dark' ? 'light' : 'dark');
+    const current = document.documentElement.getAttribute('data-night-mode') === 'true';
+    applyNightMode(!current);
 }
 
 function normalizeUiTheme(theme) {
@@ -78,6 +70,24 @@ function applyUiTheme(theme) {
     localStorage.setItem('ui-theme', normalized);
 }
 
+function applyNightMode(enabled) {
+    const isEnabled = !!enabled;
+    document.documentElement.setAttribute('data-night-mode', isEnabled ? 'true' : 'false');
+    document.documentElement.removeAttribute('data-theme');
+    localStorage.setItem('night-mode', String(isEnabled));
+    const sidebarBtn = document.getElementById('theme-toggle-sidebar');
+    if (sidebarBtn) sidebarBtn.textContent = isEnabled ? 'Light Mode' : 'Night Mode';
+    document.querySelectorAll('[data-night-mode-button]').forEach(btn => {
+        btn.innerHTML = isEnabled ? '&#9728;' : '&#9790;';
+        btn.setAttribute('aria-label', isEnabled ? 'Disable night mode' : 'Enable night mode');
+        btn.dataset.tip = isEnabled ? 'Disable night mode' : 'Enable night mode';
+    });
+    const profileToggle = document.getElementById('night-mode-toggle');
+    if (profileToggle) profileToggle.classList.toggle('on', isEnabled);
+    const profileCheck = document.getElementById('night-mode-checkbox');
+    if (profileCheck) profileCheck.checked = isEnabled;
+}
+
 function applySidebarState(state) {
     const minimized = state === 'minimized';
     const layout = document.getElementById('app-layout');
@@ -85,7 +95,7 @@ function applySidebarState(state) {
     document.body.classList.toggle('sidebar-minimized', minimized);
     if (layout) layout.classList.toggle('sidebar-minimized', minimized);
     if (toggle) {
-        toggle.innerHTML = minimized ? '&gt;&gt;' : '&lt;&lt;';
+        toggle.innerHTML = '☰';
         toggle.setAttribute('aria-label', minimized ? 'Expand sidebar' : 'Minimize sidebar');
         toggle.dataset.tip = minimized ? 'Expand sidebar' : 'Minimize sidebar';
     }
@@ -100,6 +110,37 @@ function toggleSidebar() {
 
 window.toggleSidebar = toggleSidebar;
 
+function openMobileSidebar() {
+    document.body.classList.add('mobile-sidebar-open');
+}
+
+function closeMobileSidebar() {
+    document.body.classList.remove('mobile-sidebar-open');
+    document.getElementById('user-menu')?.classList.add('hidden');
+}
+
+function toggleMobileSidebar() {
+    document.body.classList.toggle('mobile-sidebar-open');
+}
+
+window.openMobileSidebar = openMobileSidebar;
+window.closeMobileSidebar = closeMobileSidebar;
+window.toggleMobileSidebar = toggleMobileSidebar;
+
+function isMobileSidebarViewport() {
+    return window.matchMedia('(max-width: 767px)').matches;
+}
+
+function handleSidebarControl() {
+    if (isMobileSidebarViewport()) {
+        toggleMobileSidebar();
+        return;
+    }
+    toggleSidebar();
+}
+
+window.handleSidebarControl = handleSidebarControl;
+
 function setupSidebarToggle() {
     const toggle = document.getElementById('sidebar-toggle');
     if (!toggle || toggle.dataset.bound === 'true') return;
@@ -107,7 +148,7 @@ function setupSidebarToggle() {
     toggle.addEventListener('click', event => {
         event.preventDefault();
         event.stopPropagation();
-        toggleSidebar();
+        handleSidebarControl();
     });
 }
 
@@ -115,9 +156,10 @@ let sidebarTooltipEl = null;
 let sidebarTooltipTarget = null;
 
 function getSidebarTooltipTarget(target) {
+    const sidebarControl = target.closest?.('.sidebar-control[data-tip]');
+    if (sidebarControl) return sidebarControl;
     if (!document.body.classList.contains('sidebar-minimized')) return null;
-    const candidate = target.closest?.('.sidebar .nav-item[data-tip], .sidebar .user-info[data-tip], .sidebar .sidebar-toggle[data-tip]');
-    return candidate || null;
+    return target.closest?.('.sidebar .nav-item[data-tip], .sidebar .user-info[data-tip], .sidebar .sidebar-toggle[data-tip]') || null;
 }
 
 function ensureSidebarTooltip() {
@@ -211,7 +253,16 @@ function showApp() {
     renderUserInfo();
     setupNav();
     startNotificationPolling();
-    navigateTo('dashboard');
+    navigateTo(getSavedPage());
+}
+
+function getSavedPage() {
+    const page = localStorage.getItem('current-page') || 'dashboard';
+    const allowedPages = new Set([
+        'dashboard', 'tickets', 'create-ticket', 'my-tickets', 'users', 'roles',
+        'reports', 'activity-logs', 'backups', 'assets', 'add-asset', 'edit-asset', 'asset-details'
+    ]);
+    return allowedPages.has(page) ? page : 'dashboard';
 }
 
 function showSelfServicePortal(updateUrl = true) {
@@ -271,6 +322,7 @@ async function handleLogin(e) {
         if (data.success) {
             currentUser = data.user;
             applyUiTheme(currentUser.theme_preference || 'modern');
+            applyNightMode(!!currentUser.night_mode_enabled);
             showApp();
         } else {
             err.textContent = data.message;
@@ -608,6 +660,7 @@ function updateSidebarTooltips() {
 function openProfileSettings() {
     document.getElementById('user-menu')?.classList.add('hidden');
     const selectedTheme = normalizeUiTheme(currentUser?.theme_preference || localStorage.getItem('ui-theme') || 'modern');
+    const nightModeEnabled = currentUser?.night_mode_enabled ?? (localStorage.getItem('night-mode') === 'true');
     const html = `
         <div class="modal-overlay active" id="profile-settings-modal">
             <div class="modal">
@@ -624,11 +677,21 @@ function openProfileSettings() {
                         </div>
                         <select class="form-select" id="ui-theme-select">
                             <option value="modern" ${selectedTheme === 'modern' ? 'selected' : ''}>Modern</option>
-                            <option value="classic" ${selectedTheme === 'classic' ? 'selected' : ''}>Classic Windows 95/98</option>
+                            <option value="classic" ${selectedTheme === 'classic' ? 'selected' : ''}>Classic</option>
                             <option value="luna" ${selectedTheme === 'luna' ? 'selected' : ''}>Windows XP Luna</option>
                         </select>
                     </div>
-                    <div class="theme-preview ${selectedTheme === 'classic' ? 'classic-preview' : ''} ${selectedTheme === 'luna' ? 'luna-preview' : ''}" id="theme-preview">
+                    <label class="settings-block settings-toggle-block" for="night-mode-checkbox">
+                        <div>
+                            <div class="settings-title">Night Mode</div>
+                            <div class="settings-help">Use a darker global palette while keeping the selected theme.</div>
+                        </div>
+                        <span class="toggle-wrap">
+                            <input class="sr-only" type="checkbox" id="night-mode-checkbox" ${nightModeEnabled ? 'checked' : ''}>
+                            <span class="toggle ${nightModeEnabled ? 'on' : ''}" id="night-mode-toggle" aria-hidden="true"></span>
+                        </span>
+                    </label>
+                    <div class="theme-preview ${selectedTheme === 'classic' ? 'classic-preview' : ''} ${selectedTheme === 'luna' ? 'luna-preview' : ''} ${nightModeEnabled ? 'night-preview' : ''}" id="theme-preview">
                         <div class="theme-preview-title">Preview</div>
                         <div class="theme-preview-body">
                             <button class="btn btn-secondary btn-sm" type="button">Button</button>
@@ -644,22 +707,31 @@ function openProfileSettings() {
         </div>
     `;
     document.body.insertAdjacentHTML('beforeend', html);
-    document.getElementById('ui-theme-select')?.addEventListener('change', e => {
+    const updatePreview = () => {
         const preview = document.getElementById('theme-preview');
-        preview?.classList.toggle('classic-preview', e.target.value === 'classic');
-        preview?.classList.toggle('luna-preview', e.target.value === 'luna');
-    });
+        const selected = document.getElementById('ui-theme-select')?.value;
+        const nightMode = document.getElementById('night-mode-checkbox')?.checked;
+        preview?.classList.toggle('classic-preview', selected === 'classic');
+        preview?.classList.toggle('luna-preview', selected === 'luna');
+        preview?.classList.toggle('night-preview', !!nightMode);
+        document.getElementById('night-mode-toggle')?.classList.toggle('on', !!nightMode);
+    };
+    document.getElementById('ui-theme-select')?.addEventListener('change', updatePreview);
+    document.getElementById('night-mode-checkbox')?.addEventListener('change', updatePreview);
 }
 
 async function saveProfileSettings() {
     const alertEl = document.getElementById('profile-settings-alert');
     const theme = normalizeUiTheme(document.getElementById('ui-theme-select')?.value);
-    const data = await API.patch('/auth/theme', { theme_preference: theme });
+    const nightModeEnabled = !!document.getElementById('night-mode-checkbox')?.checked;
+    const data = await API.patch('/auth/theme', { theme_preference: theme, night_mode_enabled: nightModeEnabled });
 
     if (data.success) {
         currentUser.theme_preference = data.theme_preference;
+        currentUser.night_mode_enabled = !!data.night_mode_enabled;
         applyUiTheme(data.theme_preference);
-        alertEl.innerHTML = '<div class="alert alert-success">Theme saved.</div>';
+        applyNightMode(data.night_mode_enabled);
+        alertEl.innerHTML = '<div class="alert alert-success">Theme settings saved.</div>';
         setTimeout(() => closeModal('profile-settings-modal'), 700);
     } else {
         alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to save theme.')}</div>`;
@@ -667,6 +739,8 @@ async function saveProfileSettings() {
 }
 
 function navigateTo(page) {
+    closeMobileSidebar();
+    localStorage.setItem('current-page', page);
     currentPage = page;
     document.querySelectorAll('.nav-item').forEach(el => {
         el.classList.toggle('active', el.dataset.page === page);
@@ -895,18 +969,22 @@ function chartColor(label) {
     return colors[label] || 'var(--accent)';
 }
 
-function renderTicketSummaryCards(tickets = {}) {
+function renderTicketSummaryCards(tickets = {}, kpis = {}) {
     const resolvedClosed = (tickets.resolved || 0) + (tickets.closed || 0);
     const cards = [
         { label: 'Total Tickets', value: tickets.total || 0, className: '', icon: 'T' },
         { label: 'Open', value: tickets.open || 0, className: 'accent', icon: 'O' },
         { label: 'Pending', value: tickets.pending || 0, className: 'warning', icon: 'P' },
         { label: 'Resolved / Closed', value: resolvedClosed, className: 'success', icon: 'R' },
-        { label: 'Urgent Open', value: tickets.urgentOpen || 0, className: 'danger', icon: 'U' }
+        { label: 'Urgent Open', value: tickets.urgentOpen || 0, className: 'danger', icon: 'U' },
+        { label: 'Average Acknowledgement Time', value: formatDuration(kpis.avgAcknowledgementMinutes), className: 'accent', icon: 'A' },
+        { label: 'Average Resolution Time', value: formatDuration(kpis.avgResolutionMinutes), className: 'success', icon: 'R' },
+        { label: 'Total Resolved Tickets', value: kpis.totalResolvedTickets || 0, className: 'success', icon: 'T' },
+        { label: 'Overdue Tickets', value: kpis.overdueTickets || 0, className: (kpis.overdueTickets || 0) ? 'danger' : '', icon: 'O' }
     ];
 
     return `
-        <div class="stats-grid dashboard-summary">
+        <div class="stats-grid dashboard-summary dashboard-overview-grid">
             ${cards.map(card => `
                 <div class="stat-card ${card.className}">
                     <div class="stat-icon stat-letter">${card.icon}</div>
@@ -929,7 +1007,7 @@ function renderAssetSummaryCards(assets = {}) {
     ];
 
     return `
-        <div class="stats-grid dashboard-summary">
+        <div class="stats-grid dashboard-summary dashboard-asset-grid">
             ${cards.map(card => `
                 <div class="stat-card ${card.className}">
                     <div class="stat-icon stat-letter">${card.icon}</div>
@@ -1104,16 +1182,17 @@ function renderRecentAssetList(items, dateKey, emptyTitle) {
 
 function renderAnalyticsDashboard(data) {
     return `
-        <div class="dashboard-section">
+        <div class="dashboard-shell">
+        <section class="dashboard-section dashboard-section-compact">
             <div class="dashboard-section-header">
                 <div>
                     <h2>Ticket Analytics</h2>
                     <p>Operational overview of ticket volume, status, priority, and creation trends.</p>
                 </div>
             </div>
-        </div>
-        ${renderTicketSummaryCards(data.tickets)}
-        <div class="dashboard-charts-grid">
+        </section>
+        ${renderTicketSummaryCards(data.tickets, data.ticketKpis)}
+        <div class="dashboard-charts-grid ticket-dashboard-grid">
             <div class="card chart-card chart-card-large">
                 <div class="card-header"><span class="card-title">Tickets Created Per Month</span></div>
                 <div class="card-body">${renderLineChart(data.ticketsPerMonth || [], 'Tickets created per month')}</div>
@@ -1128,14 +1207,14 @@ function renderAnalyticsDashboard(data) {
             </div>
         </div>
 
-        <div class="dashboard-section">
+        <section class="dashboard-section dashboard-section-compact">
             <div class="dashboard-section-header">
                 <div>
                     <h2>Asset Analytics</h2>
                     <p>Inventory health, allocation status, category mix, and assignment movement.</p>
                 </div>
             </div>
-        </div>
+        </section>
         ${renderAssetSummaryCards(data.assets)}
         <div class="dashboard-charts-grid asset-dashboard-grid">
             <div class="card chart-card">
@@ -1158,6 +1237,7 @@ function renderAnalyticsDashboard(data) {
                 <div class="card-header"><span class="card-title">Recently Returned</span></div>
                 <div class="card-body">${renderRecentAssetList(data.recentlyReturnedAssets || [], 'returned_at', 'No recent returns')}</div>
             </div>
+        </div>
         </div>
     `;
 }
@@ -1186,12 +1266,12 @@ async function dashboard() {
 
         pageEl.innerHTML = `
             ${analyticsHtml}
-            <div class="card">
+            <div class="card dashboard-recent-card">
                 <div class="card-header">
                     <span class="card-title">Recent Tickets</span>
                     <button class="btn btn-secondary btn-sm" onclick="navigateTo('${currentUser.can_assign_tickets ? 'tickets' : 'my-tickets'}')">View All</button>
                 </div>
-                <div class="table-wrapper">
+                <div class="table-wrapper table-wrapper-scroll">
                     ${tks.length ? renderTicketTable(tks) : dashboardEmptyState('No recent tickets', 'Created tickets will appear here.')}
                 </div>
             </div>
@@ -1256,8 +1336,8 @@ async function renderTicketList(filters = {}) {
             <button class="btn btn-primary btn-sm" onclick="navigateTo('create-ticket')">➕ New Ticket</button>
         </div>
 
-        <div class="card">
-            <div class="table-wrapper">
+        <div class="card ticket-list-card">
+            <div class="table-wrapper table-wrapper-scroll">
                 ${tks.length ? renderTicketTable(tks) : '<div class="empty-state"><div class="empty-icon">🎫</div><h3>No tickets found</h3><p>Try adjusting your filters.</p></div>'}
             </div>
             ${data.total > 20 ? renderPagination(data.page, Math.ceil(data.total / data.limit), data.total) : ''}
@@ -1296,6 +1376,7 @@ function renderTicketTable(tickets) {
                     <th>Category</th>
                     <th>Priority</th>
                     <th>Status</th>
+                    <th>SLA</th>
                     <th>Assigned To</th>
                     <th>Created</th>
                 </tr>
@@ -1310,6 +1391,7 @@ function renderTicketTable(tickets) {
                         <td>${t.category_name || '—'}</td>
                         <td>${priorityBadge(t.priority)}</td>
                         <td>${statusBadge(t.status)}</td>
+                        <td>${slaStatusBadge(t.sla_status)}</td>
                         <td>${t.assigned_to_name ? `<span style="font-size:13px;">${escHtml(t.assigned_to_name)}</span>` : '<span style="color:var(--text-muted);font-size:12px;">Unassigned</span>'}</td>
                         <td style="color:var(--text-muted);font-size:12px;">${formatDate(t.created_at)}</td>
                     </tr>
@@ -1792,6 +1874,18 @@ async function openTicket(ticketId) {
                                     <span class="ticket-meta-label">Created</span>
                                     <span class="ticket-meta-value">${formatDate(t.created_at)}</span>
                                 </div>
+                                <div class="ticket-meta-item">
+                                    <span class="ticket-meta-label">SLA Status</span>
+                                    <span class="ticket-meta-value">${slaStatusBadge(t.sla_status)}</span>
+                                </div>
+                                ${t.acknowledged_at ? `<div class="ticket-meta-item">
+                                    <span class="ticket-meta-label">Acknowledged</span>
+                                    <span class="ticket-meta-value">${formatDate(t.acknowledged_at)}</span>
+                                </div>` : ''}
+                                ${t.time_to_acknowledge_minutes !== null && t.time_to_acknowledge_minutes !== undefined ? `<div class="ticket-meta-item">
+                                    <span class="ticket-meta-label">Time to Acknowledge</span>
+                                    <span class="ticket-meta-value">${formatDuration(t.time_to_acknowledge_minutes)}</span>
+                                </div>` : ''}
                                 ${t.due_date ? `<div class="ticket-meta-item">
                                     <span class="ticket-meta-label">Due Date</span>
                                     <span class="ticket-meta-value" style="color:var(--warning);">${formatDate(t.due_date)}</span>
@@ -1799,6 +1893,10 @@ async function openTicket(ticketId) {
                                 ${t.resolved_at ? `<div class="ticket-meta-item">
                                     <span class="ticket-meta-label">Resolved</span>
                                     <span class="ticket-meta-value" style="color:var(--success);">${formatDate(t.resolved_at)}</span>
+                                </div>` : ''}
+                                ${t.time_to_resolve_minutes !== null && t.time_to_resolve_minutes !== undefined ? `<div class="ticket-meta-item">
+                                    <span class="ticket-meta-label">Time to Resolve</span>
+                                    <span class="ticket-meta-value">${formatDuration(t.time_to_resolve_minutes)}</span>
                                 </div>` : ''}
                                 ${currentUser.can_assign_tickets ? `
                                 <div class="ticket-meta-item">
@@ -2645,6 +2743,18 @@ function formatDate(dateStr) {
     return d.toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+function formatDuration(minutes) {
+    if (minutes === null || minutes === undefined || Number.isNaN(Number(minutes))) return '-';
+    const totalMinutes = Math.max(0, Math.round(Number(minutes)));
+    const days = Math.floor(totalMinutes / 1440);
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    const mins = totalMinutes % 60;
+
+    if (days) return `${days}d ${hours}h`;
+    if (hours) return `${hours}h ${mins}m`;
+    return `${mins}m`;
+}
+
 function formatFileSize(bytes) {
     if (!bytes) return '0 B';
     const k = 1024;
@@ -2674,6 +2784,11 @@ function statusBadge(s) {
     return `<span class="badge badge-${map[s] || 'open'}">${s}</span>`;
 }
 
+function slaStatusBadge(status) {
+    const map = { 'On Time': 'resolved', Warning: 'pending', Overdue: 'urgent' };
+    return `<span class="badge badge-${map[status] || 'normal'}">${escHtml(status || 'On Time')}</span>`;
+}
+
 function showToast(message, type = 'success') {
     const id = 'toast-' + Date.now();
     const colors = { success: 'var(--success)', error: 'var(--danger)', warning: 'var(--warning)' };
@@ -2691,6 +2806,7 @@ function showToast(message, type = 'success') {
 document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
         document.querySelectorAll('.modal-overlay').forEach(m => m.remove());
+        closeMobileSidebar();
     }
 });
 
@@ -2733,11 +2849,13 @@ setupNav = function() {
 
 const coreNavigateTo = navigateTo;
 navigateTo = function(page) {
+    closeMobileSidebar();
     if (!['assets', 'add-asset', 'edit-asset', 'asset-details'].includes(page)) {
         coreNavigateTo(page);
         return;
     }
 
+    localStorage.setItem('current-page', page);
     currentPage = page;
     document.querySelectorAll('.nav-item').forEach(el => {
         el.classList.toggle('active', el.dataset.page === 'assets');

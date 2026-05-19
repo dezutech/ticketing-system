@@ -109,6 +109,7 @@ BEGIN
         resolution_notes NVARCHAR(MAX),
         created_at DATETIME DEFAULT GETDATE(),
         updated_at DATETIME DEFAULT GETDATE(),
+        acknowledged_at DATETIME,
         resolved_at DATETIME,
         due_date DATETIME,
         FOREIGN KEY (category_id) REFERENCES Categories(category_id),
@@ -209,7 +210,10 @@ SELECT
     t.status,
     t.created_at,
     t.updated_at,
+    t.acknowledged_at,
     t.resolved_at,
+    CASE WHEN t.acknowledged_at IS NOT NULL THEN DATEDIFF(MINUTE, t.created_at, t.acknowledged_at) END AS time_to_acknowledge_minutes,
+    CASE WHEN t.resolved_at IS NOT NULL THEN DATEDIFF(MINUTE, t.created_at, t.resolved_at) END AS time_to_resolve_minutes,
     c.category_name,
     creator.full_name AS created_by_name,
     creator.email AS created_by_email,
@@ -246,6 +250,10 @@ GO
 
 IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'theme_preference')
     ALTER TABLE Users ADD theme_preference NVARCHAR(20) NOT NULL CONSTRAINT DF_Users_theme_preference DEFAULT 'modern';
+GO
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'night_mode_enabled')
+    ALTER TABLE Users ADD night_mode_enabled BIT NOT NULL CONSTRAINT DF_Users_night_mode_enabled DEFAULT 0;
 GO
 
 IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'ActivityLogs')

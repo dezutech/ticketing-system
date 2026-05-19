@@ -21,12 +21,28 @@ const config = {
 };
 
 let pool = null;
+let schemaReady = false;
+
+async function ensureSlaColumns(db) {
+    if (schemaReady) return;
+
+    await db.request().query(`
+        IF OBJECT_ID('dbo.Tickets', 'U') IS NOT NULL
+            AND COL_LENGTH('dbo.Tickets', 'acknowledged_at') IS NULL
+        BEGIN
+            ALTER TABLE Tickets ADD acknowledged_at DATETIME NULL;
+        END
+    `);
+
+    schemaReady = true;
+}
 
 async function getPool() {
     if (!pool) {
         pool = await sql.connect(config);
         console.log('✅ Connected to SQL Server');
     }
+    await ensureSlaColumns(pool);
     return pool;
 }
 

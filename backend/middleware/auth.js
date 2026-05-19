@@ -6,6 +6,9 @@ async function ensureUserThemeColumn() {
     await query(`
         IF COL_LENGTH('Users', 'theme_preference') IS NULL
             ALTER TABLE Users ADD theme_preference NVARCHAR(20) NOT NULL CONSTRAINT DF_Users_theme_preference DEFAULT 'modern'
+
+        IF COL_LENGTH('Users', 'night_mode_enabled') IS NULL
+            ALTER TABLE Users ADD night_mode_enabled BIT NOT NULL CONSTRAINT DF_Users_night_mode_enabled DEFAULT 0
     `);
 }
 
@@ -21,7 +24,7 @@ async function authenticateToken(req, res, next) {
         await ensureUserThemeColumn();
         const result = await query(`
             SELECT u.user_id, u.username, u.email, u.full_name, u.department, u.role_id,
-                   u.must_change_password, u.theme_preference, r.role_name, r.can_assign_tickets,
+                   u.must_change_password, u.theme_preference, u.night_mode_enabled, r.role_name, r.can_assign_tickets,
                    r.can_manage_users, r.can_view_all_tickets, r.can_manage_roles
             FROM Users u
             JOIN Roles r ON u.role_id = r.role_id
@@ -48,7 +51,8 @@ async function authenticateToken(req, res, next) {
             can_view_all_tickets: !!freshUser.can_view_all_tickets,
             can_manage_roles: !!freshUser.can_manage_roles,
             must_change_password: !!freshUser.must_change_password,
-            theme_preference: freshUser.theme_preference || 'modern'
+            theme_preference: freshUser.theme_preference || 'modern',
+            night_mode_enabled: !!freshUser.night_mode_enabled
         };
         next();
     } catch (err) {
