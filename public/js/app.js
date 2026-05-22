@@ -1578,32 +1578,35 @@ async function renderTicketList(filters = {}) {
 
     pageEl.innerHTML = `
         <div class="filters-bar">
-            <div class="search-input-wrap">
-                <span class="search-icon">🔍</span>
-                <input type="text" placeholder="Search tickets..." id="search-input" value="${filters.search || ''}">
+            ${mobileFilterToggleMarkup('Filters')}
+            <div class="mobile-filter-panel" onclick="event.stopPropagation()">
+                <div class="search-input-wrap">
+                    <span class="search-icon">🔍</span>
+                    <input type="text" placeholder="Search tickets..." id="search-input" value="${filters.search || ''}">
+                </div>
+                <select class="filter-select" id="filter-status" onchange="applyFilters()">
+                    <option value="">All Status</option>
+                    <option value="Open" ${filters.status === 'Open' ? 'selected' : ''}>Open</option>
+                    <option value="In Progress" ${filters.status === 'In Progress' ? 'selected' : ''}>In Progress</option>
+                    <option value="Pending" ${filters.status === 'Pending' ? 'selected' : ''}>Pending</option>
+                    <option value="Resolved" ${filters.status === 'Resolved' ? 'selected' : ''}>Resolved</option>
+                    <option value="Closed" ${filters.status === 'Closed' ? 'selected' : ''}>Closed</option>
+                </select>
+                <select class="filter-select" id="filter-priority" onchange="applyFilters()">
+                    <option value="">All Priority</option>
+                    <option value="Urgent" ${filters.priority === 'Urgent' ? 'selected' : ''}>Urgent</option>
+                    <option value="High" ${filters.priority === 'High' ? 'selected' : ''}>High</option>
+                    <option value="Normal" ${filters.priority === 'Normal' ? 'selected' : ''}>Normal</option>
+                    <option value="Low" ${filters.priority === 'Low' ? 'selected' : ''}>Low</option>
+                </select>
+                ${currentUser.can_assign_tickets ? `
+                <select class="filter-select" id="filter-assigned" onchange="applyFilters()">
+                    <option value="">All</option>
+                    <option value="assigned" ${filters.assigned === 'assigned' ? 'selected' : ''}>Assigned</option>
+                    <option value="unassigned" ${filters.assigned === 'unassigned' ? 'selected' : ''}>Unassigned</option>
+                </select>` : ''}
+                <button class="btn btn-primary btn-sm" onclick="navigateTo('create-ticket')">➕ New Ticket</button>
             </div>
-            <select class="filter-select" id="filter-status" onchange="applyFilters()">
-                <option value="">All Status</option>
-                <option value="Open" ${filters.status === 'Open' ? 'selected' : ''}>Open</option>
-                <option value="In Progress" ${filters.status === 'In Progress' ? 'selected' : ''}>In Progress</option>
-                <option value="Pending" ${filters.status === 'Pending' ? 'selected' : ''}>Pending</option>
-                <option value="Resolved" ${filters.status === 'Resolved' ? 'selected' : ''}>Resolved</option>
-                <option value="Closed" ${filters.status === 'Closed' ? 'selected' : ''}>Closed</option>
-            </select>
-            <select class="filter-select" id="filter-priority" onchange="applyFilters()">
-                <option value="">All Priority</option>
-                <option value="Urgent" ${filters.priority === 'Urgent' ? 'selected' : ''}>Urgent</option>
-                <option value="High" ${filters.priority === 'High' ? 'selected' : ''}>High</option>
-                <option value="Normal" ${filters.priority === 'Normal' ? 'selected' : ''}>Normal</option>
-                <option value="Low" ${filters.priority === 'Low' ? 'selected' : ''}>Low</option>
-            </select>
-            ${currentUser.can_assign_tickets ? `
-            <select class="filter-select" id="filter-assigned" onchange="applyFilters()">
-                <option value="">All</option>
-                <option value="assigned" ${filters.assigned === 'assigned' ? 'selected' : ''}>Assigned</option>
-                <option value="unassigned" ${filters.assigned === 'unassigned' ? 'selected' : ''}>Unassigned</option>
-            </select>` : ''}
-            <button class="btn btn-primary btn-sm" onclick="navigateTo('create-ticket')">➕ New Ticket</button>
         </div>
 
         <div class="card ticket-list-card">
@@ -1713,16 +1716,19 @@ async function activityLogsPage(filters = currentActivityLogFilters) {
         const logs = data.logs || [];
         pageEl.innerHTML = `
             <div class="filters-bar">
-                <div class="search-input-wrap">
-                    <span class="search-icon">🔍</span>
-                    <input type="text" placeholder="Search user, action, details..." id="activity-search" value="${escHtml(currentActivityLogFilters.search || '')}">
+                ${mobileFilterToggleMarkup('Filters')}
+                <div class="mobile-filter-panel" onclick="event.stopPropagation()">
+                    <div class="search-input-wrap">
+                        <span class="search-icon">🔍</span>
+                        <input type="text" placeholder="Search user, action, details..." id="activity-search" value="${escHtml(currentActivityLogFilters.search || '')}">
+                    </div>
+                    <select class="filter-select" id="activity-module" onchange="applyActivityLogFilters()">
+                        <option value="">All modules</option>
+                        ${(data.modules || []).map(module => `<option value="${escHtml(module)}" ${currentActivityLogFilters.module === module ? 'selected' : ''}>${escHtml(module)}</option>`).join('')}
+                    </select>
+                    <input type="date" class="filter-select" id="activity-date" value="${escHtml(currentActivityLogFilters.date || '')}" onchange="applyActivityLogFilters()">
+                    <button class="btn btn-secondary btn-sm" onclick="clearActivityLogFilters()">Clear</button>
                 </div>
-                <select class="filter-select" id="activity-module" onchange="applyActivityLogFilters()">
-                    <option value="">All modules</option>
-                    ${(data.modules || []).map(module => `<option value="${escHtml(module)}" ${currentActivityLogFilters.module === module ? 'selected' : ''}>${escHtml(module)}</option>`).join('')}
-                </select>
-                <input type="date" class="filter-select" id="activity-date" value="${escHtml(currentActivityLogFilters.date || '')}" onchange="applyActivityLogFilters()">
-                <button class="btn btn-secondary btn-sm" onclick="clearActivityLogFilters()">Clear</button>
             </div>
 
             <div class="card">
@@ -2671,6 +2677,58 @@ function clearUserManagementSearch(tabId) {
 window.filterUserManagementTab = filterUserManagementTab;
 window.clearUserManagementSearch = clearUserManagementSearch;
 
+function mobileFilterToggleMarkup(label = 'Filters') {
+    return `
+        <button class="mobile-filter-toggle" type="button" onclick="toggleMobileFilterPanel(event)" aria-expanded="false">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="21" y1="4" x2="14" y2="4"></line>
+                <line x1="10" y1="4" x2="3" y2="4"></line>
+                <line x1="21" y1="12" x2="12" y2="12"></line>
+                <line x1="8" y1="12" x2="3" y2="12"></line>
+                <line x1="21" y1="20" x2="16" y2="20"></line>
+                <line x1="12" y1="20" x2="3" y2="20"></line>
+                <circle cx="12" cy="4" r="2"></circle>
+                <circle cx="10" cy="12" r="2"></circle>
+                <circle cx="14" cy="20" r="2"></circle>
+            </svg>
+            <span>${escHtml(label)}</span>
+        </button>
+    `;
+}
+
+function toggleMobileFilterPanel(event) {
+    event?.stopPropagation();
+    const bar = event?.currentTarget?.closest('.filters-bar');
+    if (!bar) return;
+
+    document.querySelectorAll('.filters-bar.mobile-filter-open').forEach(openBar => {
+        if (openBar !== bar) {
+            openBar.classList.remove('mobile-filter-open');
+            openBar.querySelector('.mobile-filter-toggle')?.setAttribute('aria-expanded', 'false');
+        }
+    });
+
+    const isOpen = bar.classList.toggle('mobile-filter-open');
+    event.currentTarget.setAttribute('aria-expanded', String(isOpen));
+}
+
+function closeMobileFilterPanels() {
+    document.querySelectorAll('.filters-bar.mobile-filter-open').forEach(bar => {
+        bar.classList.remove('mobile-filter-open');
+        bar.querySelector('.mobile-filter-toggle')?.setAttribute('aria-expanded', 'false');
+    });
+}
+
+document.addEventListener('click', (event) => {
+    if (!event.target.closest('.filters-bar')) closeMobileFilterPanels();
+});
+
+document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeMobileFilterPanels();
+});
+
+window.toggleMobileFilterPanel = toggleMobileFilterPanel;
+
 async function usersPage() {
     closeUserActionsMenu();
     const [usersData, rolesData, catsData, deptsData] = await Promise.all([
@@ -2702,11 +2760,8 @@ async function usersPage() {
 
         <div id="tab-users">
             <div class="card">
-                <div class="card-header">
-                    <span class="card-title">👥 Users</span>
-                    <button class="btn btn-primary btn-sm" onclick="openAddUserModal(${JSON.stringify(roles).replace(/"/g,'&quot;')}, ${JSON.stringify(depts).replace(/"/g,'&quot;')})">➕ Add User</button>
-                </div>
-                <div class="management-search-bar">
+                <div class="card-header management-toolbar">
+                    <button class="btn btn-primary btn-sm" onclick="openAddUserModal(${JSON.stringify(roles).replace(/"/g,'&quot;')}, ${JSON.stringify(depts).replace(/"/g,'&quot;')})">Add User</button>
                     <div class="search-input-wrap management-search-input">
                         <span class="search-icon">⌕</span>
                         <input data-management-search type="search" placeholder="Search users..." oninput="filterUserManagementTab('tab-users')" autocomplete="off">
@@ -2747,11 +2802,8 @@ async function usersPage() {
 
         <div id="tab-categories" class="hidden">
             <div class="card">
-                <div class="card-header">
-                    <span class="card-title">🗂 Categories</span>
-                    <button class="btn btn-primary btn-sm" onclick="openCategoryModal()">➕ New Category</button>
-                </div>
-                <div class="management-search-bar">
+                <div class="card-header management-toolbar">
+                    <button class="btn btn-primary btn-sm" onclick="openCategoryModal()">New Category</button>
                     <div class="search-input-wrap management-search-input">
                         <span class="search-icon">⌕</span>
                         <input data-management-search type="search" placeholder="Search categories..." oninput="filterUserManagementTab('tab-categories')" autocomplete="off">
@@ -2779,11 +2831,8 @@ async function usersPage() {
 
         <div id="tab-departments" class="hidden">
             <div class="card">
-                <div class="card-header">
-                    <span class="card-title">🏢 Departments</span>
-                    <button class="btn btn-primary btn-sm" onclick="openDepartmentModal()">➕ New Department</button>
-                </div>
-                <div class="management-search-bar">
+                <div class="card-header management-toolbar">
+                    <button class="btn btn-primary btn-sm" onclick="openDepartmentModal()">New Department</button>
                     <div class="search-input-wrap management-search-input">
                         <span class="search-icon">⌕</span>
                         <input data-management-search type="search" placeholder="Search departments..." oninput="filterUserManagementTab('tab-departments')" autocomplete="off">
@@ -3512,29 +3561,32 @@ async function assetsPage(filters = currentAssetFilters) {
         </div>
 
         <div class="filters-bar">
-            <div class="search-input-wrap">
-                <span class="search-icon">S</span>
-                <input type="text" placeholder="Search assets..." id="asset-search" value="${escHtml(currentAssetFilters.search || '')}">
+            ${mobileFilterToggleMarkup('Filters')}
+            <div class="mobile-filter-panel" onclick="event.stopPropagation()">
+                <div class="search-input-wrap">
+                    <span class="search-icon">S</span>
+                    <input type="text" placeholder="Search assets..." id="asset-search" value="${escHtml(currentAssetFilters.search || '')}">
+                </div>
+                <select class="filter-select" id="asset-status" onchange="applyAssetFilters()">
+                    <option value="">All Status</option>
+                    ${ASSET_STATUSES.map(s => `<option value="${s}" ${currentAssetFilters.status === s ? 'selected' : ''}>${s}</option>`).join('')}
+                </select>
+                <select class="filter-select" id="asset-category" onchange="applyAssetFilters()">
+                    <option value="">All Categories</option>
+                    ${meta.categories.map(c => `<option value="${c.category_id}" ${String(currentAssetFilters.category_id || '') === String(c.category_id) ? 'selected' : ''}>${escHtml(c.category_name)}</option>`).join('')}
+                </select>
+                <select class="filter-select" id="asset-department" onchange="applyAssetFilters()">
+                    <option value="">All Departments</option>
+                    ${meta.departments.map(d => `<option value="${escHtml(d.department_name)}" ${currentAssetFilters.department === d.department_name ? 'selected' : ''}>${escHtml(d.department_name)}</option>`).join('')}
+                </select>
+                <select class="filter-select" id="asset-assigned" onchange="applyAssetFilters()">
+                    <option value="">All Users</option>
+                    <option value="unassigned" ${currentAssetFilters.assigned_to === 'unassigned' ? 'selected' : ''}>Unassigned</option>
+                    ${meta.users.map(u => `<option value="${u.user_id}" ${String(currentAssetFilters.assigned_to || '') === String(u.user_id) ? 'selected' : ''}>${escHtml(u.full_name)}</option>`).join('')}
+                </select>
+                ${canManageAssets() ? `<button class="btn btn-secondary btn-sm" onclick="openAllAssetActivityLogs()">Activity Logs</button>` : ''}
+                ${canManageAssets() ? `<button class="btn btn-primary btn-sm" onclick="navigateTo('add-asset')">Add Asset</button>` : ''}
             </div>
-            <select class="filter-select" id="asset-status" onchange="applyAssetFilters()">
-                <option value="">All Status</option>
-                ${ASSET_STATUSES.map(s => `<option value="${s}" ${currentAssetFilters.status === s ? 'selected' : ''}>${s}</option>`).join('')}
-            </select>
-            <select class="filter-select" id="asset-category" onchange="applyAssetFilters()">
-                <option value="">All Categories</option>
-                ${meta.categories.map(c => `<option value="${c.category_id}" ${String(currentAssetFilters.category_id || '') === String(c.category_id) ? 'selected' : ''}>${escHtml(c.category_name)}</option>`).join('')}
-            </select>
-            <select class="filter-select" id="asset-department" onchange="applyAssetFilters()">
-                <option value="">All Departments</option>
-                ${meta.departments.map(d => `<option value="${escHtml(d.department_name)}" ${currentAssetFilters.department === d.department_name ? 'selected' : ''}>${escHtml(d.department_name)}</option>`).join('')}
-            </select>
-            <select class="filter-select" id="asset-assigned" onchange="applyAssetFilters()">
-                <option value="">All Users</option>
-                <option value="unassigned" ${currentAssetFilters.assigned_to === 'unassigned' ? 'selected' : ''}>Unassigned</option>
-                ${meta.users.map(u => `<option value="${u.user_id}" ${String(currentAssetFilters.assigned_to || '') === String(u.user_id) ? 'selected' : ''}>${escHtml(u.full_name)}</option>`).join('')}
-            </select>
-            ${canManageAssets() ? `<button class="btn btn-secondary btn-sm" onclick="openAllAssetActivityLogs()">Activity Logs</button>` : ''}
-            ${canManageAssets() ? `<button class="btn btn-primary btn-sm" onclick="navigateTo('add-asset')">Add Asset</button>` : ''}
         </div>
 
         <div id="asset-alert">${assetsData.success === false ? `<div class="alert alert-warning">${escHtml(assetsData.message || 'Asset API is not available yet.')}</div>` : ''}</div>

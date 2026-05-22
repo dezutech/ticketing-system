@@ -2256,6 +2256,14 @@ tbody tr { transition: var(--transition); }
   white-space: nowrap;
 }
 
+.mobile-filter-toggle {
+  display: none;
+}
+
+.mobile-filter-panel {
+  display: contents;
+}
+
 .search-input-wrap {
   position: relative;
   flex: 1 1 260px;
@@ -2283,6 +2291,22 @@ tbody tr { transition: var(--transition); }
 
 .management-search-bar {
   padding: 0 16px 12px;
+}
+
+.management-toolbar {
+  align-items: center;
+  gap: 16px;
+}
+
+.management-toolbar .btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.management-toolbar .management-search-input {
+  flex: 0 1 420px;
+  margin-left: auto;
+  min-width: 0;
 }
 
 .management-search-input {
@@ -3286,6 +3310,55 @@ tbody tr { transition: var(--transition); }
     align-items: stretch;
   }
 
+  .mobile-filter-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    align-self: flex-start;
+    width: auto;
+    min-height: 38px;
+    padding: 8px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-sm);
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .mobile-filter-toggle:hover,
+  .filters-bar.mobile-filter-open .mobile-filter-toggle {
+    background: var(--bg-hover);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .mobile-filter-panel {
+    display: none;
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    z-index: 1500;
+    max-height: min(70dvh, 460px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-md);
+  }
+
+  .filters-bar.mobile-filter-open .mobile-filter-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
   .filters-bar .btn,
   .filter-select,
   .search-input-wrap {
@@ -3295,6 +3368,36 @@ tbody tr { transition: var(--transition); }
 
   .filters-bar .btn {
     margin-left: 0;
+  }
+
+  .filters-bar .mobile-filter-toggle {
+    width: auto;
+  }
+
+  .mobile-filter-panel .btn,
+  .mobile-filter-panel .filter-select,
+  .mobile-filter-panel .search-input-wrap {
+    flex: 0 0 auto;
+    min-width: 0;
+  }
+
+  .management-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .management-toolbar .btn,
+  .management-toolbar .management-search-input {
+    flex: 0 0 auto;
+    width: 100%;
+    max-width: none;
+    margin-left: 0;
+    min-width: 0;
+  }
+
+  .management-toolbar .btn {
+    justify-content: center;
   }
 
   body.sidebar-minimized #user-menu,
