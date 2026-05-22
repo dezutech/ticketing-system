@@ -3,16 +3,17 @@ const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
 const { query, sql } = require('../config/database');
-const { authenticateToken, requirePermission } = require('../middleware/auth');
+const { authenticateToken, requirePermission, ensureUserThemeColumn } = require('../middleware/auth');
 const { logActivity } = require('../utils/activityLogger');
 
 // GET /api/users
 router.get('/', authenticateToken, requirePermission('can_manage_users'), async (req, res) => {
     try {
+        await ensureUserThemeColumn();
         const result = await query(`
             SELECT u.user_id, u.username, u.email, u.full_name, u.department, u.phone,
                 u.position, u.branch, u.is_active, u.created_at, u.last_login, u.must_change_password,
-                r.role_name, r.role_id
+                u.profile_status, r.role_name, r.role_id
             FROM Users u JOIN Roles r ON u.role_id = r.role_id
             ORDER BY u.created_at DESC
         `);
@@ -26,8 +27,9 @@ router.get('/', authenticateToken, requirePermission('can_manage_users'), async 
 // GET /api/users/all-users — for "Request by" dropdown (admin/staff only)
 router.get('/all-users', authenticateToken, requirePermission('can_assign_tickets'), async (req, res) => {
     try {
+        await ensureUserThemeColumn();
         const result = await query(`
-            SELECT user_id, full_name, email, department FROM Users
+            SELECT user_id, full_name, email, department, profile_status FROM Users
             WHERE is_active = 1 ORDER BY full_name
         `);
         res.json({ success: true, users: result.recordset });
@@ -39,8 +41,9 @@ router.get('/all-users', authenticateToken, requirePermission('can_assign_ticket
 // GET /api/users/staff
 router.get('/staff', authenticateToken, requirePermission('can_assign_tickets'), async (req, res) => {
     try {
+        await ensureUserThemeColumn();
         const result = await query(`
-            SELECT u.user_id, u.full_name, u.email, r.role_name
+            SELECT u.user_id, u.full_name, u.email, u.profile_status, r.role_name
             FROM Users u JOIN Roles r ON u.role_id = r.role_id
             WHERE u.is_active = 1 AND r.role_name IN ('Admin', 'Staff', 'Super Admin')
             ORDER BY u.full_name

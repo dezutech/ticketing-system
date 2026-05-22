@@ -22,6 +22,7 @@ const passwordResetRateLimits = new Map();
 const PASSWORD_RESET_TOKEN_TTL = 10 * 60 * 1000;
 const PASSWORD_RESET_RATE_WINDOW = 15 * 60 * 1000;
 const PASSWORD_RESET_RATE_MAX = 8;
+let ticketTransferHistoryEnsured = false;
 
 // Multer config
 const storage = multer.diskStorage({
@@ -108,6 +109,30 @@ function ticketLink(ticketId) {
 
 function ticketNotificationOptions(type, ticketId, title) {
     return { title, type, relatedTicketId: Number(ticketId) };
+}
+
+async function ensureTicketTransferHistoryTable() {
+    if (ticketTransferHistoryEnsured) return;
+    await query(`
+        IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'TicketTransferHistory')
+        BEGIN
+            CREATE TABLE TicketTransferHistory (
+                transfer_id INT PRIMARY KEY IDENTITY(1,1),
+                ticket_id INT NOT NULL,
+                previous_assignee INT NULL,
+                new_assignee INT NOT NULL,
+                transferred_by INT NOT NULL,
+                transfer_reason NVARCHAR(MAX) NOT NULL,
+                transferred_at DATETIME NOT NULL DEFAULT GETDATE(),
+                FOREIGN KEY (ticket_id) REFERENCES Tickets(ticket_id) ON DELETE CASCADE,
+                FOREIGN KEY (previous_assignee) REFERENCES Users(user_id),
+                FOREIGN KEY (new_assignee) REFERENCES Users(user_id),
+                FOREIGN KEY (transferred_by) REFERENCES Users(user_id)
+            );
+            CREATE INDEX IX_TicketTransferHistory_ticket ON TicketTransferHistory(ticket_id, transferred_at DESC);
+        END
+    `);
+    ticketTransferHistoryEnsured = true;
 }
 
 function cleanText(value, max = 4000) {
@@ -367,6 +392,7 @@ router.get('/', authenticateToken, async (req, res) => {
                     creator.full_name AS created_by_name,
                     assignee.full_name AS assigned_to_name,
                     assignee.user_id AS assigned_to_id,
+                    assignee.profile_status AS assigned_to_status,
                     t.department,
                     (SELECT COUNT(*) FROM TicketAttachments ta WHERE ta.ticket_id = t.ticket_id) AS attachment_count,
                     (SELECT COUNT(*) FROM TicketComments tc WHERE tc.ticket_id = t.ticket_id) AS comment_count
@@ -655,7 +681,8 @@ router.get('/:id', authenticateToken, async (req, res) => {
                     ELSE 'On Time'
                 END AS sla_status,
                 creator.full_name AS created_by_name, creator.email AS created_by_email,
-                assignee.full_name AS assigned_to_name, assignee.email AS assigned_to_email, assignee.user_id AS assigned_to_id
+                assignee.full_name AS assigned_to_name, assignee.email AS assigned_to_email,
+                assignee.user_id AS assigned_to_id, assignee.profile_status AS assigned_to_status
             FROM Tickets t
             LEFT JOIN Categories c ON t.category_id = c.category_id
             LEFT JOIN Users creator ON t.created_by = creator.user_id
@@ -685,6 +712,21 @@ router.get('/:id', authenticateToken, async (req, res) => {
             WHERE th.ticket_id = @id ORDER BY th.changed_at DESC
         `, { id: { type: sql.Int, value: req.params.id } });
 
+        await ensureTicketTransferHistoryTable();
+        const transferHistory = await query(`
+            SELECT th.transfer_id, th.ticket_id, th.previous_assignee, th.new_assignee,
+                   th.transferred_by, th.transfer_reason, th.transferred_at,
+                   previousUser.full_name AS previous_assignee_name,
+                   newUser.full_name AS new_assignee_name,
+                   transferredBy.full_name AS transferred_by_name
+            FROM TicketTransferHistory th
+            LEFT JOIN Users previousUser ON th.previous_assignee = previousUser.user_id
+            JOIN Users newUser ON th.new_assignee = newUser.user_id
+            JOIN Users transferredBy ON th.transferred_by = transferredBy.user_id
+            WHERE th.ticket_id = @id
+            ORDER BY th.transferred_at DESC
+        `, { id: { type: sql.Int, value: req.params.id } });
+
         let linkedAssets = [];
         try {
             const assets = await query(`
@@ -708,6 +750,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
             attachments: attachments.recordset,
             comments: comments.recordset,
             history: history.recordset,
+            transfer_history: transferHistory.recordset,
             assets: linkedAssets,
             linked_assets: linkedAssets
         });
@@ -798,6 +841,129 @@ router.post('/', authenticateToken, upload.array('attachments', 5), async (req, 
 });
 
 // PATCH /api/tickets/:id — update ticket (status, assign, etc.)
+// POST /api/tickets/:id/transfer - transfer assigned ticket with required reason
+router.post('/:id/transfer', authenticateToken, async (req, res) => {
+    try {
+        if (!req.user.can_assign_tickets) {
+            return res.status(403).json({ success: false, message: 'Permission denied.' });
+        }
+
+        const ticketId = req.params.id;
+        const newAssignee = nullableInt(req.body.new_assignee);
+        const reason = cleanText(req.body.transfer_reason, 2000);
+
+        if (!newAssignee || !Number.isInteger(newAssignee)) {
+            return res.status(400).json({ success: false, message: 'Select a valid new assignee.' });
+        }
+        if (!reason) {
+            return res.status(400).json({ success: false, message: 'Transfer reason is required.' });
+        }
+
+        const existing = await query(`
+            SELECT t.*, assignee.full_name AS assigned_to_name
+            FROM Tickets t
+            LEFT JOIN Users assignee ON t.assigned_to = assignee.user_id
+            WHERE t.ticket_id = @id
+        `, { id: { type: sql.Int, value: ticketId } });
+        if (!existing.recordset.length) return res.status(404).json({ success: false, message: 'Ticket not found.' });
+
+        const ticket = existing.recordset[0];
+        if (!ticket.assigned_to) {
+            return res.status(400).json({ success: false, message: 'Only assigned tickets can be transferred.' });
+        }
+        if (Number(ticket.assigned_to) === newAssignee) {
+            return res.status(400).json({ success: false, message: 'Ticket is already assigned to that user.' });
+        }
+
+        const targetResult = await query(`
+            SELECT u.user_id, u.full_name, u.profile_status, r.role_name
+            FROM Users u
+            JOIN Roles r ON u.role_id = r.role_id
+            WHERE u.user_id = @id
+              AND u.is_active = 1
+              AND r.role_name IN ('Super Admin', 'Admin', 'Staff')
+        `, { id: { type: sql.Int, value: newAssignee } });
+        if (!targetResult.recordset.length) {
+            return res.status(400).json({ success: false, message: 'Transfer target must be an active IT staff/admin user.' });
+        }
+
+        const target = targetResult.recordset[0];
+        if (['On Leave', 'Offline'].includes(target.profile_status)) {
+            return res.status(400).json({ success: false, message: `Cannot transfer to ${target.full_name} while status is ${target.profile_status}.` });
+        }
+
+        await ensureTicketTransferHistoryTable();
+        await query(`
+            SET XACT_ABORT ON;
+            BEGIN TRANSACTION;
+
+            UPDATE Tickets
+            SET assigned_to = @newAssignee,
+                updated_at = GETDATE()
+            WHERE ticket_id = @ticketId
+
+            INSERT INTO TicketTransferHistory (
+                ticket_id, previous_assignee, new_assignee, transferred_by, transfer_reason
+            )
+            VALUES (
+                @ticketId, @previousAssignee, @newAssignee, @transferredBy, @reason
+            )
+
+            INSERT INTO TicketHistory (ticket_id, changed_by, field_changed, old_value, new_value)
+            VALUES (@ticketId, @transferredBy, 'transfer', @oldValue, @newValue)
+
+            COMMIT TRANSACTION;
+        `, {
+            ticketId: { type: sql.Int, value: ticketId },
+            previousAssignee: { type: sql.Int, value: ticket.assigned_to },
+            newAssignee: { type: sql.Int, value: newAssignee },
+            transferredBy: { type: sql.Int, value: req.user.user_id },
+            reason: { type: sql.NVarChar, value: reason },
+            oldValue: { type: sql.NVarChar, value: nullableString(ticket.assigned_to) },
+            newValue: { type: sql.NVarChar, value: nullableString(newAssignee) }
+        });
+
+        await logActivity(req.user, 'Ticket transferred', 'Tickets', ticketId, {
+            from: ticket.assigned_to,
+            to: newAssignee,
+            reason
+        });
+
+        await notifyUsers(
+            [newAssignee],
+            `${ticket.ticket_number} - ${ticket.title} was transferred to you. Reason: ${reason}`,
+            'Tickets',
+            ticketId,
+            ticketLink(ticketId),
+            ticketNotificationOptions('ticket_transferred', ticketId, 'Ticket transferred to you')
+        );
+
+        await notifyUsers(
+            [ticket.assigned_to],
+            `${ticket.ticket_number} - ${ticket.title} was transferred away from you`,
+            'Tickets',
+            ticketId,
+            ticketLink(ticketId),
+            ticketNotificationOptions('ticket_transferred_away', ticketId, 'Ticket transferred')
+        );
+
+        const adminRecipients = await getAdminNotificationRecipients([req.user.user_id, newAssignee, ticket.assigned_to]);
+        await notifyUsers(
+            adminRecipients,
+            `${ticket.ticket_number} - ${ticket.title} was transferred to ${target.full_name}`,
+            'Tickets',
+            ticketId,
+            ticketLink(ticketId),
+            ticketNotificationOptions('ticket_transfer_update', ticketId, 'Ticket transfer recorded')
+        );
+
+        res.json({ success: true, message: 'Ticket transferred.' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
 router.patch('/:id', authenticateToken, async (req, res) => {
     try {
         const { status, assigned_to, resolution_notes, priority, due_date, asset_id } = req.body;

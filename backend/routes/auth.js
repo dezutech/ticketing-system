@@ -8,6 +8,7 @@ const { authenticateToken, ensureUserThemeColumn } = require('../middleware/auth
 const { logActivity } = require('../utils/activityLogger');
 
 const THEME_PREFERENCES = ['modern', 'classic', 'luna'];
+const PROFILE_STATUSES = ['Active', 'Busy', 'On Break', 'Away', 'On Leave', 'Offline'];
 
 // POST /api/auth/login
 router.post('/login', async (req, res) => {
@@ -57,7 +58,8 @@ router.post('/login', async (req, res) => {
             can_manage_roles: user.can_manage_roles,
             must_change_password: user.must_change_password ? true : false,
             theme_preference: user.theme_preference || 'modern',
-            night_mode_enabled: !!user.night_mode_enabled
+            night_mode_enabled: !!user.night_mode_enabled,
+            profile_status: user.profile_status || 'Active'
         };
 
         const token = jwt.sign(tokenPayload, process.env.JWT_SECRET, { expiresIn: '8h' });
@@ -82,6 +84,15 @@ router.post('/logout', async (req, res) => {
     if (token) {
         try {
             const decoded = jwt.verify(token, process.env.JWT_SECRET);
+            await ensureUserThemeColumn();
+            await query(`
+                UPDATE Users
+                SET profile_status = 'Offline',
+                    updated_at = GETDATE()
+                WHERE user_id = @id
+            `, {
+                id: { type: sql.Int, value: decoded.user_id }
+            });
             await logActivity(decoded, 'User logout', 'Authentication', decoded.user_id, 'User signed out');
         } catch (err) {
             console.warn('Logout activity log skipped:', err.message);
@@ -94,6 +105,32 @@ router.post('/logout', async (req, res) => {
 // GET /api/auth/me
 router.get('/me', authenticateToken, (req, res) => {
     res.json({ success: true, user: req.user });
+});
+
+// PATCH /api/auth/status
+router.patch('/status', authenticateToken, async (req, res) => {
+    try {
+        const { profile_status } = req.body;
+        if (!PROFILE_STATUSES.includes(profile_status)) {
+            return res.status(400).json({ success: false, message: 'Invalid profile status.' });
+        }
+
+        await ensureUserThemeColumn();
+        await query(`
+            UPDATE Users
+            SET profile_status = @status,
+                updated_at = GETDATE()
+            WHERE user_id = @id
+        `, {
+            status: { type: sql.NVarChar, value: profile_status },
+            id: { type: sql.Int, value: req.user.user_id }
+        });
+
+        res.json({ success: true, message: 'Status updated.', profile_status });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
 });
 
 // PATCH /api/auth/theme

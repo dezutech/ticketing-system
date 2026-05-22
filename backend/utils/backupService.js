@@ -16,6 +16,7 @@ const BACKUP_TABLES = [
     'TicketAttachments',
     'TicketComments',
     'TicketHistory',
+    'TicketTransferHistory',
     'asset_assignments',
     'asset_maintenance_logs',
     'asset_activity_logs',

@@ -156,20 +156,44 @@
 
         <div class="sidebar-footer">
             <div class="sidebar-footer-actions">
-            <div class="user-info" onclick="toggleUserMenu()">
-                <div class="user-avatar" id="user-avatar">—</div>
+            <div class="user-info" onclick="toggleUserMenu(event)">
+                <div class="user-avatar-wrap">
+                    <div class="user-avatar" id="user-avatar">—</div>
+                    <span class="presence-dot presence-offline" id="user-presence-dot" aria-hidden="true"></span>
+                </div>
                 <div class="user-info-text">
                     <div class="user-name" id="user-name">Loading...</div>
                     <div class="user-role" id="user-role"></div>
                 </div>
             </div>
             </div>
-            <div id="user-menu" class="hidden" style="margin-top:4px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden;">
+            <div id="user-menu-legacy" class="hidden" style="display:none;">
                 <button onclick="openProfileSettings()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--text-primary);cursor:pointer;font-family:inherit;">⚙ Profile Settings</button>
                 <button onclick="openChangePassword()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--text-primary);cursor:pointer;font-family:inherit;">🔑 Change Password</button>
                 <button onclick="toggleTheme()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--text-primary);cursor:pointer;font-family:inherit;" id="theme-toggle-sidebar">Night Mode</button>
                 <hr style="margin:0;border-color:var(--border);">
                 <button onclick="handleLogout()" style="width:100%;text-align:left;padding:9px 14px;background:none;border:none;font-size:13px;color:var(--danger);cursor:pointer;font-family:inherit;">🚪 Sign Out</button>
+            </div>
+            <div id="user-menu" class="user-menu hidden">
+                <div class="user-menu-header">
+                    <div class="user-avatar-wrap">
+                        <div class="user-avatar user-avatar-sm" id="menu-user-avatar">--</div>
+                        <span class="presence-dot presence-offline" id="menu-presence-dot" aria-hidden="true"></span>
+                    </div>
+                    <div class="user-menu-person">
+                        <strong id="menu-user-name">Loading...</strong>
+                        <span id="menu-user-status">Offline</span>
+                    </div>
+                </div>
+                <button class="user-menu-item" onclick="openViewProfile()">View Profile</button>
+                <div class="user-menu-section">
+                    <button class="user-menu-item status-menu-toggle" id="status-menu-toggle" onclick="toggleStatusMenu(event)" type="button" aria-expanded="false">
+                        <span>Change Status</span>
+                    </button>
+                    <div class="status-menu-options hidden" id="status-menu-options"></div>
+                </div>
+                <button class="user-menu-item" onclick="openProfileSettings()">Settings</button>
+                <button class="user-menu-item danger" onclick="handleLogout()">Logout</button>
             </div>
         </div>
     </aside>
@@ -180,10 +204,11 @@
         <!-- TOPBAR -->
         <header class="topbar">
             <button class="btn-icon sidebar-control" id="sidebar-toggle" data-tip="Minimize sidebar" aria-label="Minimize sidebar" type="button">☰</button>
-            <div>
+            <div class="topbar-title-wrap">
                 <span class="topbar-title" id="page-title">Dashboard</span>
             </div>
             <div class="topbar-actions">
+                <button class="btn btn-primary btn-sm topbar-new-ticket" onclick="navigateTo('create-ticket')">+ New Ticket</button>
                 <div class="notification-wrap hidden">
                     <button class="btn-icon notification-btn" id="notification-toggle-old" data-tip="Notifications">
                         🔔
@@ -200,7 +225,10 @@
                     </div>
                 </div>
                 <button class="btn-icon" onclick="toggleTheme()" data-night-mode-button data-tip="Toggle night mode" aria-label="Toggle night mode">&#9790;</button>
-                <button class="btn btn-primary btn-sm" onclick="navigateTo('create-ticket')">➕ New Ticket</button>
+                <button class="topbar-profile-button" onclick="toggleUserMenu(event)" type="button" aria-label="User profile">
+                    <span class="user-avatar topbar-user-avatar" id="topbar-user-avatar">--</span>
+                    <span class="presence-dot presence-offline" id="topbar-presence-dot" aria-hidden="true"></span>
+                </button>
             </div>
         </header>
 
@@ -235,18 +263,49 @@
 <script src="/js/app.js"></script>
 <script>
 // Extra UI helpers not in app.js
-function toggleUserMenu() {
+function toggleUserMenu(event) {
+    event?.preventDefault();
+    event?.stopPropagation();
     const menu = document.getElementById('user-menu');
-    menu.classList.toggle('hidden');
+    if (!menu) return;
+    const willOpen = menu.classList.contains('hidden');
+    menu.classList.toggle('hidden', !willOpen);
+    if (willOpen) {
+        setStatusMenuExpanded?.(false);
+        updateUserMenuPosition(event?.currentTarget || document.querySelector('.user-info'));
+    }
+}
+
+function updateUserMenuPosition(anchor) {
+    const menu = document.getElementById('user-menu');
+    if (!menu || !anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    const width = Math.min(260, window.innerWidth - 24);
+    const height = menu.offsetHeight || 280;
+    const left = Math.max(12, Math.min(rect.right - width, window.innerWidth - width - 12));
+    const preferredTop = rect.bottom + 8;
+    const top = Math.max(12, Math.min(preferredTop, window.innerHeight - height - 12));
+    menu.style.width = `${width}px`;
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
 }
 
 document.addEventListener('click', (e) => {
     const menu = document.getElementById('user-menu');
-    if (menu && !menu.classList.contains('hidden')) {
-        if (!e.target.closest('.sidebar-footer')) {
-            menu.classList.add('hidden');
-        }
+    if (!menu || menu.classList.contains('hidden')) return;
+    const clickedMenu = e.target.closest('#user-menu');
+    const clickedToggle = e.target.closest('.user-info, .topbar-profile-button');
+    if (clickedMenu || clickedToggle) return;
+
+    menu.classList.add('hidden');
+    if (window.matchMedia('(max-width: 767px)').matches && document.body.classList.contains('mobile-sidebar-open')) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
     }
+}, true);
+
+window.addEventListener('resize', () => {
+    document.getElementById('user-menu')?.classList.add('hidden');
 });
 
 function openChangePassword() {

@@ -178,6 +178,28 @@ END
 GO
 
 -- ============================================
+-- TICKET TRANSFER HISTORY TABLE
+-- ============================================
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'TicketTransferHistory')
+BEGIN
+    CREATE TABLE TicketTransferHistory (
+        transfer_id INT PRIMARY KEY IDENTITY(1,1),
+        ticket_id INT NOT NULL,
+        previous_assignee INT NULL,
+        new_assignee INT NOT NULL,
+        transferred_by INT NOT NULL,
+        transfer_reason NVARCHAR(MAX) NOT NULL,
+        transferred_at DATETIME NOT NULL DEFAULT GETDATE(),
+        FOREIGN KEY (ticket_id) REFERENCES Tickets(ticket_id) ON DELETE CASCADE,
+        FOREIGN KEY (previous_assignee) REFERENCES Users(user_id),
+        FOREIGN KEY (new_assignee) REFERENCES Users(user_id),
+        FOREIGN KEY (transferred_by) REFERENCES Users(user_id)
+    );
+    CREATE INDEX IX_TicketTransferHistory_ticket ON TicketTransferHistory(ticket_id, transferred_at DESC);
+END
+GO
+
+-- ============================================
 -- STORED PROCEDURE: Generate Ticket Number
 -- ============================================
 IF OBJECT_ID('dbo.GenerateTicketNumber', 'P') IS NOT NULL
@@ -254,6 +276,10 @@ GO
 
 IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'night_mode_enabled')
     ALTER TABLE Users ADD night_mode_enabled BIT NOT NULL CONSTRAINT DF_Users_night_mode_enabled DEFAULT 0;
+GO
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'profile_status')
+    ALTER TABLE Users ADD profile_status NVARCHAR(20) NOT NULL CONSTRAINT DF_Users_profile_status DEFAULT 'Active';
 GO
 
 IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'ActivityLogs')

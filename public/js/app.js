@@ -28,6 +28,14 @@ let lastSeenNotificationId = 0;
 let lastNotificationSoundAt = 0;
 let passwordResetLookupToken = null;
 let passwordResetVerifiedToken = null;
+const PROFILE_STATUSES = ['Active', 'Busy', 'On Break', 'Away', 'On Leave', 'Offline'];
+const IDLE_AWAY_TIMEOUT_MS = 30 * 60 * 1000;
+const IDLE_ACTIVITY_THROTTLE_MS = 5000;
+let idleAwayTimer = null;
+let idleTrackingBound = false;
+let lastIdleActivityHandledAt = 0;
+let autoAwayStatusSet = false;
+let usersActionContext = { usersById: new Map(), roles: [], depts: [] };
 
 // ─── INIT ───
 document.addEventListener('DOMContentLoaded', async () => {
@@ -77,6 +85,8 @@ function applyNightMode(enabled) {
     localStorage.setItem('night-mode', String(isEnabled));
     const sidebarBtn = document.getElementById('theme-toggle-sidebar');
     if (sidebarBtn) sidebarBtn.textContent = isEnabled ? 'Light Mode' : 'Night Mode';
+    const menuThemeBtn = document.getElementById('theme-toggle-sidebar-new');
+    if (menuThemeBtn) menuThemeBtn.textContent = isEnabled ? 'Light Mode' : 'Night Mode';
     document.querySelectorAll('[data-night-mode-button]').forEach(btn => {
         btn.innerHTML = isEnabled ? '&#9728;' : '&#9790;';
         btn.setAttribute('aria-label', isEnabled ? 'Disable night mode' : 'Enable night mode');
@@ -112,15 +122,18 @@ window.toggleSidebar = toggleSidebar;
 
 function openMobileSidebar() {
     document.body.classList.add('mobile-sidebar-open');
+    hideSidebarTooltip();
 }
 
 function closeMobileSidebar() {
     document.body.classList.remove('mobile-sidebar-open');
     document.getElementById('user-menu')?.classList.add('hidden');
+    hideSidebarTooltip();
 }
 
 function toggleMobileSidebar() {
     document.body.classList.toggle('mobile-sidebar-open');
+    hideSidebarTooltip();
 }
 
 window.openMobileSidebar = openMobileSidebar;
@@ -129,6 +142,10 @@ window.toggleMobileSidebar = toggleMobileSidebar;
 
 function isMobileSidebarViewport() {
     return window.matchMedia('(max-width: 767px)').matches;
+}
+
+function supportsDesktopHover() {
+    return window.matchMedia('(hover: hover) and (pointer: fine)').matches;
 }
 
 function handleSidebarControl() {
@@ -156,6 +173,7 @@ let sidebarTooltipEl = null;
 let sidebarTooltipTarget = null;
 
 function getSidebarTooltipTarget(target) {
+    if (!supportsDesktopHover() || isMobileSidebarViewport()) return null;
     const sidebarControl = target.closest?.('.sidebar-control[data-tip]');
     if (sidebarControl) return sidebarControl;
     if (!document.body.classList.contains('sidebar-minimized')) return null;
@@ -232,12 +250,20 @@ function setupSidebarTooltips() {
         const target = getSidebarTooltipTarget(event.target);
         if (target) hideSidebarTooltip(target);
     });
-    window.addEventListener('resize', () => positionSidebarTooltip(sidebarTooltipTarget));
+    document.addEventListener('touchstart', () => hideSidebarTooltip(), { passive: true });
+    window.addEventListener('resize', () => {
+        if (!supportsDesktopHover() || isMobileSidebarViewport()) {
+            hideSidebarTooltip();
+            return;
+        }
+        positionSidebarTooltip(sidebarTooltipTarget);
+    });
     window.addEventListener('scroll', () => hideSidebarTooltip(), true);
 }
 
 // ─── AUTH ───
 function showLogin() {
+    stopIdleAwayDetection();
     document.getElementById('self-service-page')?.classList.add('hidden');
     document.getElementById('login-page').classList.remove('hidden');
     document.getElementById('app-layout').classList.add('hidden');
@@ -253,6 +279,7 @@ function showApp() {
     renderUserInfo();
     setupNav();
     startNotificationPolling();
+    startIdleAwayDetection();
     navigateTo(getSavedPage());
 }
 
@@ -483,6 +510,8 @@ window.submitPasswordResetRequest = submitPasswordResetRequest;
 
 async function handleLogout() {
     await API.post('/auth/logout');
+    setAutoAwayStoredFlag(false);
+    stopIdleAwayDetection();
     currentUser = null;
     stopNotificationPolling();
     document.getElementById('notification-count')?.classList.add('hidden');
@@ -645,9 +674,197 @@ function setupNav() {
 function renderUserInfo() {
     const initials = currentUser.full_name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase();
     document.getElementById('user-avatar').textContent = initials;
+    document.getElementById('topbar-user-avatar').textContent = initials;
+    document.getElementById('menu-user-avatar').textContent = initials;
     document.getElementById('user-name').textContent = currentUser.full_name;
     document.getElementById('user-role').textContent = currentUser.role_name;
-    document.querySelector('.user-info')?.setAttribute('data-tip', `${currentUser.full_name} - ${currentUser.role_name}`);
+    const status = normalizeProfileStatus(currentUser.profile_status);
+    const sidebarStatus = document.getElementById('user-profile-status');
+    if (sidebarStatus) sidebarStatus.textContent = status;
+    document.getElementById('menu-user-name').textContent = currentUser.full_name;
+    document.getElementById('menu-user-status').textContent = `${currentUser.role_name} – ${status}`;
+    ['user-presence-dot', 'topbar-presence-dot', 'menu-presence-dot'].forEach(id => {
+        setPresenceDot(document.getElementById(id), status);
+    });
+    renderStatusMenuOptions();
+    document.querySelector('.user-info')?.setAttribute('data-tip', `${currentUser.full_name} - ${currentUser.role_name} - ${normalizeProfileStatus(currentUser.profile_status)}`);
+}
+
+function normalizeProfileStatus(status) {
+    return PROFILE_STATUSES.includes(status) ? status : 'Active';
+}
+
+function profileStatusTone(status) {
+    const map = {
+        Active: 'active',
+        Busy: 'busy',
+        Away: 'away',
+        'On Break': 'break',
+        'On Leave': 'leave',
+        Offline: 'offline'
+    };
+    return map[normalizeProfileStatus(status)] || 'active';
+}
+
+function setPresenceDot(dot, status) {
+    if (!dot) return;
+    dot.className = `presence-dot presence-${profileStatusTone(status)}`;
+    dot.title = normalizeProfileStatus(status);
+    dot.setAttribute('aria-label', normalizeProfileStatus(status));
+}
+
+function profileStatusBadge(status, compact = false) {
+    const normalized = normalizeProfileStatus(status);
+    return `<span class="presence-label ${compact ? 'compact' : ''}"><span class="presence-dot presence-${profileStatusTone(normalized)}"></span><span>${escHtml(normalized)}</span></span>`;
+}
+
+function profileStatusOptions(selected) {
+    const normalized = normalizeProfileStatus(selected);
+    return PROFILE_STATUSES.map(status => `<option value="${status}" ${status === normalized ? 'selected' : ''}>${status}</option>`).join('');
+}
+
+function renderStatusMenuOptions() {
+    const menu = document.getElementById('status-menu-options');
+    if (!menu || !currentUser) return;
+    const currentStatus = normalizeProfileStatus(currentUser.profile_status);
+    menu.innerHTML = PROFILE_STATUSES.map(status => `
+        <button class="status-menu-option ${status === currentStatus ? 'active' : ''}" onclick="updateProfileStatus('${status}')">
+            <span class="presence-dot presence-${profileStatusTone(status)}"></span>
+            <span>${escHtml(status)}</span>
+        </button>
+    `).join('');
+}
+
+function setStatusMenuExpanded(expanded) {
+    const menu = document.getElementById('status-menu-options');
+    const toggle = document.getElementById('status-menu-toggle');
+    if (!menu || !toggle) return;
+    menu.classList.toggle('hidden', !expanded);
+    toggle.classList.toggle('expanded', expanded);
+    toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+}
+
+function toggleStatusMenu(event) {
+    event?.preventDefault();
+    event?.stopPropagation();
+    const menu = document.getElementById('status-menu-options');
+    if (!menu) return;
+    setStatusMenuExpanded(menu.classList.contains('hidden'));
+}
+
+window.toggleStatusMenu = toggleStatusMenu;
+
+async function updateProfileStatus(status, options = {}) {
+    const normalized = normalizeProfileStatus(status);
+    const data = await API.patch('/auth/status', { profile_status: normalized });
+    if (data.success) {
+        currentUser.profile_status = data.profile_status;
+        if (options.automaticAway) {
+            autoAwayStatusSet = normalized === 'Away';
+            setAutoAwayStoredFlag(autoAwayStatusSet);
+        } else if (options.restoreAutomaticAway) {
+            autoAwayStatusSet = false;
+            setAutoAwayStoredFlag(false);
+        } else {
+            autoAwayStatusSet = false;
+            setAutoAwayStoredFlag(false);
+            resetIdleAwayTimer();
+        }
+        renderUserInfo();
+        if (!options.silent) {
+            document.getElementById('user-menu')?.classList.add('hidden');
+            showToast('Profile status updated.', 'success');
+        }
+    } else {
+        renderUserInfo();
+        if (!options.silent) showToast(data.message || 'Unable to update profile status.', 'error');
+    }
+    return data;
+}
+
+function autoAwayStorageKey() {
+    return currentUser?.user_id ? `profile-auto-away-${currentUser.user_id}` : null;
+}
+
+function setAutoAwayStoredFlag(value) {
+    const key = autoAwayStorageKey();
+    if (!key) return;
+    if (value) localStorage.setItem(key, 'true');
+    else localStorage.removeItem(key);
+}
+
+function getAutoAwayStoredFlag() {
+    const key = autoAwayStorageKey();
+    return key ? localStorage.getItem(key) === 'true' : false;
+}
+
+function canSetAutomaticAway() {
+    return !!currentUser && normalizeProfileStatus(currentUser.profile_status) === 'Active';
+}
+
+function resetIdleAwayTimer() {
+    if (idleAwayTimer) clearTimeout(idleAwayTimer);
+    idleAwayTimer = null;
+    if (!currentUser || !canSetAutomaticAway()) return;
+    idleAwayTimer = setTimeout(setAutomaticAwayStatus, IDLE_AWAY_TIMEOUT_MS);
+}
+
+async function setAutomaticAwayStatus() {
+    idleAwayTimer = null;
+    if (!canSetAutomaticAway()) return;
+    await updateProfileStatus('Away', { silent: true, automaticAway: true });
+}
+
+async function restoreAutomaticAwayStatus() {
+    if (!currentUser || !autoAwayStatusSet || normalizeProfileStatus(currentUser.profile_status) !== 'Away') return;
+    const data = await updateProfileStatus('Active', { silent: true, restoreAutomaticAway: true });
+    if (data.success) resetIdleAwayTimer();
+}
+
+function handleIdleActivity(force = false) {
+    if (!currentUser) return;
+    const now = Date.now();
+    if (!force && now - lastIdleActivityHandledAt < IDLE_ACTIVITY_THROTTLE_MS) return;
+    lastIdleActivityHandledAt = now;
+
+    if (autoAwayStatusSet) {
+        restoreAutomaticAwayStatus();
+        return;
+    }
+
+    resetIdleAwayTimer();
+}
+
+function handleVisibilityForIdle() {
+    if (!currentUser) return;
+    if (document.visibilityState === 'visible') {
+        handleIdleActivity(true);
+    } else {
+        resetIdleAwayTimer();
+    }
+}
+
+function bindIdleAwayDetection() {
+    if (idleTrackingBound) return;
+    idleTrackingBound = true;
+    ['mousemove', 'keydown', 'click', 'touchstart', 'touchmove'].forEach(eventName => {
+        document.addEventListener(eventName, () => handleIdleActivity(false), { passive: true });
+    });
+    document.addEventListener('visibilitychange', handleVisibilityForIdle);
+}
+
+function startIdleAwayDetection() {
+    bindIdleAwayDetection();
+    autoAwayStatusSet = normalizeProfileStatus(currentUser?.profile_status) === 'Away' && getAutoAwayStoredFlag();
+    lastIdleActivityHandledAt = Date.now();
+    resetIdleAwayTimer();
+}
+
+function stopIdleAwayDetection() {
+    if (idleAwayTimer) clearTimeout(idleAwayTimer);
+    idleAwayTimer = null;
+    autoAwayStatusSet = false;
+    lastIdleActivityHandledAt = 0;
 }
 
 function updateSidebarTooltips() {
@@ -655,6 +872,40 @@ function updateSidebarTooltips() {
         const label = item.querySelector('.nav-text')?.textContent?.trim();
         if (label) item.dataset.tip = label;
     });
+}
+
+function openViewProfile() {
+    document.getElementById('user-menu')?.classList.add('hidden');
+    const status = normalizeProfileStatus(currentUser?.profile_status);
+    const html = `
+        <div class="modal-overlay active" id="view-profile-modal">
+            <div class="modal" style="max-width:440px;">
+                <div class="modal-header">
+                    <span class="modal-title">Profile</span>
+                    <button class="modal-close" onclick="closeModal('view-profile-modal')">x</button>
+                </div>
+                <div class="modal-body">
+                    <div class="profile-summary">
+                        <div class="user-avatar-wrap">
+                            <div class="user-avatar profile-summary-avatar">${escHtml((currentUser.full_name || '?').split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase())}</div>
+                            <span class="presence-dot presence-${profileStatusTone(status)}"></span>
+                        </div>
+                        <div>
+                            <h3>${escHtml(currentUser.full_name)}</h3>
+                            <p>${escHtml(currentUser.role_name || '')}${currentUser.department ? ' - ' + escHtml(currentUser.department) : ''}</p>
+                            ${profileStatusBadge(status)}
+                        </div>
+                    </div>
+                    <div class="profile-detail-list">
+                        <div><span>Email</span><strong>${escHtml(currentUser.email || '-')}</strong></div>
+                        <div><span>Username</span><strong>${escHtml(currentUser.username || '-')}</strong></div>
+                        <div><span>Department</span><strong>${escHtml(currentUser.department || '-')}</strong></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', html);
 }
 
 function openProfileSettings() {
@@ -691,6 +942,15 @@ function openProfileSettings() {
                             <span class="toggle ${nightModeEnabled ? 'on' : ''}" id="night-mode-toggle" aria-hidden="true"></span>
                         </span>
                     </label>
+                    <div class="settings-block">
+                        <div>
+                            <div class="settings-title">Profile Status</div>
+                            <div class="settings-help">Shown beside your name for staff and users. Ticket logic is unchanged.</div>
+                        </div>
+                        <select class="form-select" id="profile-status-settings-select">
+                            ${profileStatusOptions(currentUser?.profile_status)}
+                        </select>
+                    </div>
                     <div class="theme-preview ${selectedTheme === 'classic' ? 'classic-preview' : ''} ${selectedTheme === 'luna' ? 'luna-preview' : ''} ${nightModeEnabled ? 'night-preview' : ''}" id="theme-preview">
                         <div class="theme-preview-title">Preview</div>
                         <div class="theme-preview-body">
@@ -724,14 +984,24 @@ async function saveProfileSettings() {
     const alertEl = document.getElementById('profile-settings-alert');
     const theme = normalizeUiTheme(document.getElementById('ui-theme-select')?.value);
     const nightModeEnabled = !!document.getElementById('night-mode-checkbox')?.checked;
+    const profileStatus = normalizeProfileStatus(document.getElementById('profile-status-settings-select')?.value);
     const data = await API.patch('/auth/theme', { theme_preference: theme, night_mode_enabled: nightModeEnabled });
 
     if (data.success) {
+        const statusChanged = profileStatus !== normalizeProfileStatus(currentUser.profile_status);
+        if (statusChanged) {
+            const statusData = await updateProfileStatus(profileStatus, { silent: true });
+            if (!statusData.success) {
+                alertEl.innerHTML = `<div class="alert alert-error">${escHtml(statusData.message || 'Unable to save profile status.')}</div>`;
+                return;
+            }
+        }
         currentUser.theme_preference = data.theme_preference;
         currentUser.night_mode_enabled = !!data.night_mode_enabled;
         applyUiTheme(data.theme_preference);
         applyNightMode(data.night_mode_enabled);
-        alertEl.innerHTML = '<div class="alert alert-success">Theme settings saved.</div>';
+        renderUserInfo();
+        alertEl.innerHTML = '<div class="alert alert-success">Profile settings saved.</div>';
         setTimeout(() => closeModal('profile-settings-modal'), 700);
     } else {
         alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to save theme.')}</div>`;
@@ -1392,7 +1662,7 @@ function renderTicketTable(tickets) {
                         <td>${priorityBadge(t.priority)}</td>
                         <td>${statusBadge(t.status)}</td>
                         <td>${slaStatusBadge(t.sla_status)}</td>
-                        <td>${t.assigned_to_name ? `<span style="font-size:13px;">${escHtml(t.assigned_to_name)}</span>` : '<span style="color:var(--text-muted);font-size:12px;">Unassigned</span>'}</td>
+                        <td>${t.assigned_to_name ? `<div class="user-name-with-status"><span>${escHtml(t.assigned_to_name)}</span>${profileStatusBadge(t.assigned_to_status, true)}</div>` : '<span style="color:var(--text-muted);font-size:12px;">Unassigned</span>'}</td>
                         <td style="color:var(--text-muted);font-size:12px;">${formatDate(t.created_at)}</td>
                     </tr>
                 `).join('')}
@@ -1707,6 +1977,7 @@ async function openTicket(ticketId) {
     if (!data.success) return showToast(data.message, 'error');
 
     const { ticket: t, attachments, comments, history } = data;
+    const transferHistory = data.transfer_history || [];
     const linkedAssets = data.linked_assets || data.assets || [];
     const linkedAsset = linkedAssets[0] || null;
     const assetData = await assetRequest('GET', '/');
@@ -1714,10 +1985,12 @@ async function openTicket(ticketId) {
         (assetData.assets || []).map(a => `<option value="${a.asset_id}" ${linkedAsset && linkedAsset.asset_id === a.asset_id ? 'selected' : ''}>${escHtml(a.asset_tag)} - ${escHtml(a.asset_name)}</option>`).join('');
 
     let staffOptions = '';
+    let transferStaff = [];
     if (currentUser.can_assign_tickets) {
         const staffData = await API.get('/users/staff');
+        transferStaff = staffData.staff || [];
         staffOptions = `<option value="">Unassigned</option>` +
-            (staffData.staff || []).map(s => `<option value="${s.user_id}" ${t.assigned_to_id == s.user_id ? 'selected' : ''}>${escHtml(s.full_name)} (${escHtml(s.role_name)})</option>`).join('');
+            transferStaff.map(s => `<option value="${s.user_id}" ${t.assigned_to_id == s.user_id ? 'selected' : ''}>${escHtml(s.full_name)} (${escHtml(s.role_name)} - ${escHtml(normalizeProfileStatus(s.profile_status))})</option>`).join('');
     }
 
     const modalHtml = `
@@ -1830,6 +2103,25 @@ async function openTicket(ticketId) {
 
                             <!-- HISTORY TAB -->
                             <div id="tab-history" class="hidden">
+                                ${transferHistory.length ? `
+                                <div style="margin-bottom:18px;">
+                                    <div class="form-label">Transfer History</div>
+                                    <div style="display:flex;flex-direction:column;gap:8px;">
+                                        ${transferHistory.map(tr => `
+                                            <div style="border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;background:var(--bg);">
+                                                <div class="user-name-with-status" style="font-size:13px;margin-bottom:6px;">
+                                                    <strong>${escHtml(tr.previous_assignee_name || 'Unassigned')}</strong>
+                                                    <span style="color:var(--text-muted);">to</span>
+                                                    <strong>${escHtml(tr.new_assignee_name || 'Unknown')}</strong>
+                                                </div>
+                                                <div style="font-size:12px;color:var(--text-secondary);line-height:1.5;">
+                                                    Transferred by ${escHtml(tr.transferred_by_name || 'Unknown')} | ${formatDate(tr.transferred_at)}
+                                                </div>
+                                                <div style="font-size:12.5px;color:var(--text-primary);margin-top:6px;line-height:1.5;">${escHtml(tr.transfer_reason)}</div>
+                                            </div>
+                                        `).join('')}
+                                    </div>
+                                </div>` : ''}
                                 ${history.length ? `
                                 <div style="display:flex;flex-direction:column;gap:8px;">
                                     ${history.map(h => `
@@ -1904,10 +2196,11 @@ async function openTicket(ticketId) {
                                     <select class="form-select" style="margin-top:4px;" onchange="assignTicket(${t.ticket_id}, this.value)">
                                         ${staffOptions}
                                     </select>
+                                    ${t.assigned_to_id ? `<button class="btn btn-secondary btn-sm" style="margin-top:8px;width:100%;justify-content:center;" onclick='openTransferTicketModal(${t.ticket_id}, ${t.assigned_to_id}, ${JSON.stringify(transferStaff).replace(/'/g, "&#39;")})'>Transfer Ticket</button>` : ''}
                                 </div>` : `
                                 <div class="ticket-meta-item">
                                     <span class="ticket-meta-label">Assigned To</span>
-                                    <span class="ticket-meta-value">${t.assigned_to_name || 'Unassigned'}</span>
+                                    <span class="ticket-meta-value">${t.assigned_to_name ? `<span class="user-name-with-status">${escHtml(t.assigned_to_name)} ${profileStatusBadge(t.assigned_to_status, true)}</span>` : 'Unassigned'}</span>
                                 </div>`}
                                 <div class="ticket-meta-item">
                                     <span class="ticket-meta-label">Linked Asset</span>
@@ -1958,6 +2251,85 @@ async function assignTicket(id, userId) {
     const data = await API.patch(`/tickets/${id}`, { assigned_to: userId || null });
     if (data.success) showToast('Ticket assigned!', 'success');
     else showToast(data.message, 'error');
+}
+
+function openTransferTicketModal(ticketId, currentAssigneeId, staff = []) {
+    const candidates = (staff || []).filter(user => Number(user.user_id) !== Number(currentAssigneeId));
+    const options = candidates.map(user => {
+        const status = normalizeProfileStatus(user.profile_status);
+        const blocked = ['On Leave', 'Offline'].includes(status);
+        return `<option value="${user.user_id}" data-status="${escHtml(status)}" ${blocked ? 'disabled' : ''}>${escHtml(user.full_name)} (${escHtml(user.role_name)} - ${escHtml(status)}${blocked ? ' unavailable' : ''})</option>`;
+    }).join('');
+
+    const html = `
+        <div class="modal-overlay active" id="transfer-ticket-modal">
+            <div class="modal" style="max-width:520px;">
+                <div class="modal-header">
+                    <span class="modal-title">Transfer Ticket</span>
+                    <button class="modal-close" onclick="closeModal('transfer-ticket-modal')">x</button>
+                </div>
+                <div class="modal-body">
+                    <div id="transfer-ticket-alert"></div>
+                    <div class="form-group">
+                        <label class="form-label">New Assignee <span class="required">*</span></label>
+                        <select class="form-select" id="transfer-assignee" onchange="updateTransferAssigneeWarning()">
+                            <option value="">Select staff...</option>
+                            ${options || '<option value="" disabled>No other staff available</option>'}
+                        </select>
+                        <div class="form-hint" id="transfer-assignee-hint">Users who are On Leave or Offline cannot receive transferred tickets.</div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Transfer Reason <span class="required">*</span></label>
+                        <textarea class="form-textarea" id="transfer-reason" rows="4" placeholder="Why is this ticket being transferred?"></textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="closeModal('transfer-ticket-modal')">Cancel</button>
+                    <button class="btn btn-primary" onclick="submitTicketTransfer(${ticketId})">Transfer</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.insertAdjacentHTML('beforeend', html);
+}
+
+function updateTransferAssigneeWarning() {
+    const select = document.getElementById('transfer-assignee');
+    const hint = document.getElementById('transfer-assignee-hint');
+    const status = select?.selectedOptions?.[0]?.dataset?.status;
+    if (!hint) return;
+    if (['On Leave', 'Offline'].includes(status)) {
+        hint.textContent = `This user is ${status} and cannot receive a transfer.`;
+        hint.style.color = 'var(--danger)';
+    } else {
+        hint.textContent = 'Users who are On Leave or Offline cannot receive transferred tickets.';
+        hint.style.color = 'var(--text-muted)';
+    }
+}
+
+async function submitTicketTransfer(ticketId) {
+    const alertEl = document.getElementById('transfer-ticket-alert');
+    const newAssignee = document.getElementById('transfer-assignee')?.value;
+    const reason = document.getElementById('transfer-reason')?.value.trim();
+    if (!newAssignee || !reason) {
+        alertEl.innerHTML = '<div class="alert alert-error">Select a new assignee and enter a transfer reason.</div>';
+        return;
+    }
+
+    const data = await API.post(`/tickets/${ticketId}/transfer`, {
+        new_assignee: newAssignee,
+        transfer_reason: reason
+    });
+    if (data.success) {
+        closeModal('transfer-ticket-modal');
+        closeModal('ticket-modal');
+        showToast('Ticket transferred!', 'success');
+        if (currentPage === 'dashboard') dashboard();
+        else renderTicketList();
+        openTicket(ticketId);
+    } else {
+        alertEl.innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to transfer ticket.')}</div>`;
+    }
 }
 
 async function submitComment(ticketId) {
@@ -2179,7 +2551,128 @@ async function submitCreateTicket(e) {
 }
 
 // ─── USERS PAGE ───
+function closeUserActionsMenu() {
+    document.getElementById('user-actions-menu')?.remove();
+    document.querySelectorAll('.user-actions-trigger.active').forEach(btn => {
+        btn.classList.remove('active');
+        btn.setAttribute('aria-expanded', 'false');
+    });
+}
+
+function positionUserActionsMenu(menu, anchor) {
+    const rect = anchor.getBoundingClientRect();
+    const width = Math.min(190, window.innerWidth - 24);
+    const viewportGap = 8;
+    const height = Math.min(menu.offsetHeight || 140, Math.floor(window.innerHeight * 0.7));
+    const left = Math.max(viewportGap, Math.min(rect.right - width, window.innerWidth - width - viewportGap));
+    const spaceBelow = window.innerHeight - rect.bottom - viewportGap;
+    const top = spaceBelow >= height
+        ? rect.bottom + 6
+        : Math.max(viewportGap, rect.top - height - 6);
+
+    menu.style.width = `${width}px`;
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+}
+
+function toggleUserActionsMenu(event, userId) {
+    event?.preventDefault();
+    event?.stopPropagation();
+    const anchor = event?.currentTarget;
+    const existing = document.getElementById('user-actions-menu');
+    if (existing?.dataset.userId === String(userId)) {
+        closeUserActionsMenu();
+        return;
+    }
+
+    closeUserActionsMenu();
+    const user = usersActionContext.usersById.get(Number(userId));
+    if (!user || !anchor) return;
+    anchor.classList.add('active');
+    anchor.setAttribute('aria-expanded', 'true');
+
+    const canToggleStatus = Number(user.user_id) !== Number(currentUser?.user_id);
+    const menu = document.createElement('div');
+    menu.id = 'user-actions-menu';
+    menu.className = 'user-actions-menu';
+    menu.dataset.userId = String(userId);
+    menu.setAttribute('role', 'menu');
+    menu.innerHTML = `
+        <button class="user-actions-menu-item" onclick="handleUserTableAction('edit', ${user.user_id})" type="button" role="menuitem">Edit</button>
+        <button class="user-actions-menu-item warning" onclick="handleUserTableAction('reset', ${user.user_id})" type="button" role="menuitem">Reset Password</button>
+        ${canToggleStatus ? `<button class="user-actions-menu-item ${user.is_active ? 'danger' : 'success'}" onclick="handleUserTableAction('toggle', ${user.user_id})" type="button" role="menuitem">${user.is_active ? 'Deactivate' : 'Activate'}</button>` : ''}
+    `;
+    document.body.appendChild(menu);
+    positionUserActionsMenu(menu, anchor);
+}
+
+function handleUserTableAction(action, userId) {
+    const user = usersActionContext.usersById.get(Number(userId));
+    if (!user) return closeUserActionsMenu();
+    closeUserActionsMenu();
+    if (action === 'edit') {
+        openEditUserModal(user, usersActionContext.roles, usersActionContext.depts);
+        return;
+    }
+    if (action === 'reset') {
+        confirmResetPassword(user.user_id, user.full_name);
+        return;
+    }
+    if (action === 'toggle') {
+        toggleUserStatus(user.user_id, user.is_active);
+    }
+}
+
+document.addEventListener('click', event => {
+    const menu = document.getElementById('user-actions-menu');
+    if (!menu) return;
+    if (menu.contains(event.target) || event.target.closest?.('.user-actions-trigger')) return;
+    closeUserActionsMenu();
+});
+window.addEventListener('resize', closeUserActionsMenu);
+window.addEventListener('scroll', closeUserActionsMenu, true);
+
+window.toggleUserActionsMenu = toggleUserActionsMenu;
+window.handleUserTableAction = handleUserTableAction;
+
+function userManagementSearchText(parts = []) {
+    return escHtml(parts.filter(value => value !== null && value !== undefined).join(' ').toLowerCase());
+}
+
+function filterUserManagementTab(tabId) {
+    const tab = document.getElementById(tabId);
+    if (!tab) return;
+    const input = tab.querySelector('[data-management-search]');
+    const clearBtn = tab.querySelector('.management-search-clear');
+    const query = (input?.value || '').trim().toLowerCase();
+    const rows = Array.from(tab.querySelectorAll('.user-management-row'));
+    let visibleCount = 0;
+
+    rows.forEach(row => {
+        const haystack = row.dataset.search || '';
+        const visible = !query || haystack.includes(query);
+        row.classList.toggle('hidden', !visible);
+        if (visible) visibleCount += 1;
+    });
+
+    tab.querySelector('.user-management-empty-row')?.classList.toggle('hidden', visibleCount !== 0);
+    if (clearBtn) clearBtn.classList.toggle('hidden', !query);
+}
+
+function clearUserManagementSearch(tabId) {
+    const tab = document.getElementById(tabId);
+    const input = tab?.querySelector('[data-management-search]');
+    if (!input) return;
+    input.value = '';
+    filterUserManagementTab(tabId);
+    input.focus();
+}
+
+window.filterUserManagementTab = filterUserManagementTab;
+window.clearUserManagementSearch = clearUserManagementSearch;
+
 async function usersPage() {
+    closeUserActionsMenu();
     const [usersData, rolesData, catsData, deptsData] = await Promise.all([
         API.get('/users'), API.get('/users/roles'),
         API.get('/users/categories'), API.get('/users/departments')
@@ -2194,6 +2687,11 @@ async function usersPage() {
     const roles = rolesData.roles || [];
     const cats = catsData.categories || [];
     const depts = deptsData.departments || [];
+    usersActionContext = {
+        usersById: new Map(users.map(user => [Number(user.user_id), user])),
+        roles,
+        depts
+    };
 
     document.getElementById('page-content').innerHTML = `
         <div class="tabs" style="margin-bottom:16px;">
@@ -2208,6 +2706,13 @@ async function usersPage() {
                     <span class="card-title">👥 Users</span>
                     <button class="btn btn-primary btn-sm" onclick="openAddUserModal(${JSON.stringify(roles).replace(/"/g,'&quot;')}, ${JSON.stringify(depts).replace(/"/g,'&quot;')})">➕ Add User</button>
                 </div>
+                <div class="management-search-bar">
+                    <div class="search-input-wrap management-search-input">
+                        <span class="search-icon">⌕</span>
+                        <input data-management-search type="search" placeholder="Search users..." oninput="filterUserManagementTab('tab-users')" autocomplete="off">
+                        <button class="management-search-clear hidden" onclick="clearUserManagementSearch('tab-users')" type="button" aria-label="Clear search">x</button>
+                    </div>
+                </div>
                 <div class="table-wrapper">
                     <table>
                         <thead><tr>
@@ -2217,8 +2722,8 @@ async function usersPage() {
                         </tr></thead>
                         <tbody>
                             ${users.map(u => `
-                                <tr>
-                                    <td><strong>${escHtml(u.full_name)}</strong>${u.must_change_password ? ' <span style="font-size:10px;color:var(--warning);">⚠ Must change pw</span>' : ''}</td>
+                                <tr class="user-management-row" data-search="${userManagementSearchText([u.full_name, u.username, u.email, u.role_name, u.department, u.position, u.branch, u.phone])}">
+                                    <td><div class="user-name-with-status"><strong>${escHtml(u.full_name)}</strong>${profileStatusBadge(u.profile_status, true)}</div>${u.must_change_password ? ' <span style="font-size:10px;color:var(--warning);">⚠ Must change pw</span>' : ''}</td>
                                     <td><code style="font-size:12px;background:var(--bg-input);padding:2px 6px;border-radius:4px;">${escHtml(u.username)}</code></td>
                                     <td style="color:var(--text-muted);font-size:13px;">${escHtml(u.email)}</td>
                                     <td><span class="badge badge-normal">${escHtml(u.role_name)}</span></td>
@@ -2229,15 +2734,11 @@ async function usersPage() {
                                     <td><span class="badge ${u.is_active ? 'badge-resolved' : 'badge-closed'}">${u.is_active ? 'Active' : 'Inactive'}</span></td>
                                     <td style="color:var(--text-muted);font-size:12px;">${u.last_login ? formatDate(u.last_login) : 'Never'}</td>
                                     <td>
-                                        <div style="display:flex;gap:4px;flex-wrap:wrap;">
-                                            <button class="btn btn-secondary btn-sm" onclick='openEditUserModal(${JSON.stringify(u).replace(/'/g,"&#39;")}, ${JSON.stringify(roles).replace(/'/g,"&#39;")}, ${JSON.stringify(depts).replace(/'/g,"&#39;")})'>Edit</button>
-                                            <button class="btn btn-sm" style="background:var(--warning-light);color:var(--warning);" onclick="confirmResetPassword(${u.user_id}, '${escHtml(u.full_name)}')">Reset PW</button>
-                                            ${u.user_id !== currentUser.user_id ? `
-                                            <button class="btn btn-sm" style="background:var(--${u.is_active ? 'danger' : 'success'}-light);color:var(--${u.is_active ? 'danger' : 'success'});" onclick="toggleUserStatus(${u.user_id}, ${u.is_active})">${u.is_active ? 'Deactivate' : 'Activate'}</button>` : ''}
-                                        </div>
+                                        <button class="btn-icon user-actions-trigger" onclick="toggleUserActionsMenu(event, ${u.user_id})" type="button" aria-label="User actions" aria-haspopup="menu" aria-expanded="false">⋮</button>
                                     </td>
                                 </tr>
                             `).join('')}
+                            <tr class="user-management-empty-row hidden"><td colspan="11"><div class="table-empty-state">No users match your search.</div></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -2250,18 +2751,26 @@ async function usersPage() {
                     <span class="card-title">🗂 Categories</span>
                     <button class="btn btn-primary btn-sm" onclick="openCategoryModal()">➕ New Category</button>
                 </div>
+                <div class="management-search-bar">
+                    <div class="search-input-wrap management-search-input">
+                        <span class="search-icon">⌕</span>
+                        <input data-management-search type="search" placeholder="Search categories..." oninput="filterUserManagementTab('tab-categories')" autocomplete="off">
+                        <button class="management-search-clear hidden" onclick="clearUserManagementSearch('tab-categories')" type="button" aria-label="Clear search">x</button>
+                    </div>
+                </div>
                 <div class="table-wrapper">
                     <table>
                         <thead><tr><th>Name</th><th>Description</th><th>Status</th><th>Actions</th></tr></thead>
                         <tbody>
                             ${cats.map(c => `
-                                <tr>
+                                <tr class="user-management-row" data-search="${userManagementSearchText([c.category_name, c.description, c.is_active ? 'active' : 'inactive'])}">
                                     <td><strong>${escHtml(c.category_name)}</strong></td>
                                     <td style="color:var(--text-muted);font-size:13px;">${c.description || '—'}</td>
                                     <td><span class="badge ${c.is_active ? 'badge-resolved' : 'badge-closed'}">${c.is_active ? 'Active' : 'Inactive'}</span></td>
                                     <td><button class="btn btn-secondary btn-sm" onclick='openCategoryModal(${JSON.stringify(c).replace(/'/g,"&#39;")})'>Edit</button></td>
                                 </tr>
                             `).join('')}
+                            <tr class="user-management-empty-row hidden"><td colspan="4"><div class="table-empty-state">No categories match your search.</div></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -2274,18 +2783,26 @@ async function usersPage() {
                     <span class="card-title">🏢 Departments</span>
                     <button class="btn btn-primary btn-sm" onclick="openDepartmentModal()">➕ New Department</button>
                 </div>
+                <div class="management-search-bar">
+                    <div class="search-input-wrap management-search-input">
+                        <span class="search-icon">⌕</span>
+                        <input data-management-search type="search" placeholder="Search departments..." oninput="filterUserManagementTab('tab-departments')" autocomplete="off">
+                        <button class="management-search-clear hidden" onclick="clearUserManagementSearch('tab-departments')" type="button" aria-label="Clear search">x</button>
+                    </div>
+                </div>
                 <div class="table-wrapper">
                     <table>
                         <thead><tr><th>Name</th><th>Description</th><th>Status</th><th>Actions</th></tr></thead>
                         <tbody>
                             ${depts.map(d => `
-                                <tr>
+                                <tr class="user-management-row" data-search="${userManagementSearchText([d.department_name, d.description, d.head, d.manager, d.head_name, d.manager_name, d.is_active ? 'active' : 'inactive'])}">
                                     <td><strong>${escHtml(d.department_name)}</strong></td>
                                     <td style="color:var(--text-muted);font-size:13px;">${d.description || '—'}</td>
                                     <td><span class="badge ${d.is_active ? 'badge-resolved' : 'badge-closed'}">${d.is_active ? 'Active' : 'Inactive'}</span></td>
                                     <td><button class="btn btn-secondary btn-sm" onclick='openDepartmentModal(${JSON.stringify(d).replace(/'/g,"&#39;")})'>Edit</button></td>
                                 </tr>
                             `).join('')}
+                            <tr class="user-management-empty-row hidden"><td colspan="4"><div class="table-empty-state">No departments match your search.</div></td></tr>
                         </tbody>
                     </table>
                 </div>
