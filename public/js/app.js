@@ -26,6 +26,11 @@ let notificationPollTimer = null;
 let lastUnreadNotificationCount = 0;
 let lastSeenNotificationId = 0;
 let lastNotificationSoundAt = 0;
+let latestNotifications = [];
+let dashboardSearchQuery = '';
+let dashboardSearchData = { urgentTickets: [], notifications: [], ticketsById: new Map() };
+let dashboardTicketVolumeRange = 'weekly';
+let dashboardTicketVolumeContext = { tickets: [], stats: {} };
 let passwordResetLookupToken = null;
 let passwordResetVerifiedToken = null;
 const PROFILE_STATUSES = ['Active', 'Busy', 'On Break', 'Away', 'On Leave', 'Offline'];
@@ -63,13 +68,28 @@ async function checkAuth() {
 }
 
 // ─── THEME ───
-function toggleTheme() {
+async function toggleTheme() {
     const current = document.documentElement.getAttribute('data-night-mode') === 'true';
-    applyNightMode(!current);
+    const next = !current;
+    applyNightMode(next);
+    if (!currentUser) return;
+    currentUser.night_mode_enabled = next;
+    try {
+        const data = await API.patch('/auth/theme', {
+            theme_preference: currentUser.theme_preference || 'modern',
+            night_mode_enabled: next
+        });
+        if (data.success === false) throw new Error(data.message || 'Unable to save night mode.');
+        currentUser.theme_preference = data.theme_preference || 'modern';
+        currentUser.night_mode_enabled = !!data.night_mode_enabled;
+        applyNightMode(currentUser.night_mode_enabled);
+    } catch (error) {
+        console.warn('Night mode preference was not saved.', error);
+    }
 }
 
 function normalizeUiTheme(theme) {
-    return ['modern', 'classic', 'luna'].includes(theme) ? theme : 'modern';
+    return 'modern';
 }
 
 function applyUiTheme(theme) {
@@ -167,6 +187,11 @@ function setupSidebarToggle() {
         event.stopPropagation();
         handleSidebarControl();
     });
+    toggle.addEventListener('touchend', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        handleSidebarControl();
+    }, { passive: false });
 }
 
 let sidebarTooltipEl = null;
@@ -524,6 +549,7 @@ async function loadNotifications() {
     const data = await API.get('/notifications?limit=20');
     if (!data.success) return;
     const notifications = data.notifications || [];
+    latestNotifications = notifications;
     const newestId = notifications[0]?.notification_id || 0;
     const unreadCount = data.unread_count || 0;
     if (lastSeenNotificationId && newestId > lastSeenNotificationId && unreadCount > lastUnreadNotificationCount) {
@@ -910,7 +936,6 @@ function openViewProfile() {
 
 function openProfileSettings() {
     document.getElementById('user-menu')?.classList.add('hidden');
-    const selectedTheme = normalizeUiTheme(currentUser?.theme_preference || localStorage.getItem('ui-theme') || 'modern');
     const nightModeEnabled = currentUser?.night_mode_enabled ?? (localStorage.getItem('night-mode') === 'true');
     const html = `
         <div class="modal-overlay active" id="profile-settings-modal">
@@ -921,21 +946,10 @@ function openProfileSettings() {
                 </div>
                 <div class="modal-body">
                     <div id="profile-settings-alert"></div>
-                    <div class="settings-block">
-                        <div>
-                            <div class="settings-title">Interface Theme</div>
-                            <div class="settings-help">Choose how the whole ticketing system should look after login.</div>
-                        </div>
-                        <select class="form-select" id="ui-theme-select">
-                            <option value="modern" ${selectedTheme === 'modern' ? 'selected' : ''}>Modern</option>
-                            <option value="classic" ${selectedTheme === 'classic' ? 'selected' : ''}>Classic</option>
-                            <option value="luna" ${selectedTheme === 'luna' ? 'selected' : ''}>Windows XP Luna</option>
-                        </select>
-                    </div>
                     <label class="settings-block settings-toggle-block" for="night-mode-checkbox">
                         <div>
                             <div class="settings-title">Night Mode</div>
-                            <div class="settings-help">Use a darker global palette while keeping the selected theme.</div>
+                            <div class="settings-help">Switch between the light interface and the dark interface.</div>
                         </div>
                         <span class="toggle-wrap">
                             <input class="sr-only" type="checkbox" id="night-mode-checkbox" ${nightModeEnabled ? 'checked' : ''}>
@@ -951,11 +965,11 @@ function openProfileSettings() {
                             ${profileStatusOptions(currentUser?.profile_status)}
                         </select>
                     </div>
-                    <div class="theme-preview ${selectedTheme === 'classic' ? 'classic-preview' : ''} ${selectedTheme === 'luna' ? 'luna-preview' : ''} ${nightModeEnabled ? 'night-preview' : ''}" id="theme-preview">
+                    <div class="theme-preview ${nightModeEnabled ? 'night-preview' : ''}" id="theme-preview">
                         <div class="theme-preview-title">Preview</div>
                         <div class="theme-preview-body">
                             <button class="btn btn-secondary btn-sm" type="button">Button</button>
-                            <input class="form-input" value="${selectedTheme === 'classic' ? 'Classic panel' : selectedTheme === 'luna' ? 'Luna dialog panel' : 'Modern panel'}" readonly>
+                            <input class="form-input" value="${nightModeEnabled ? 'Dark interface' : 'Light interface'}" readonly>
                         </div>
                     </div>
                 </div>
@@ -969,20 +983,18 @@ function openProfileSettings() {
     document.body.insertAdjacentHTML('beforeend', html);
     const updatePreview = () => {
         const preview = document.getElementById('theme-preview');
-        const selected = document.getElementById('ui-theme-select')?.value;
         const nightMode = document.getElementById('night-mode-checkbox')?.checked;
-        preview?.classList.toggle('classic-preview', selected === 'classic');
-        preview?.classList.toggle('luna-preview', selected === 'luna');
         preview?.classList.toggle('night-preview', !!nightMode);
+        const previewInput = preview?.querySelector('input');
+        if (previewInput) previewInput.value = nightMode ? 'Dark interface' : 'Light interface';
         document.getElementById('night-mode-toggle')?.classList.toggle('on', !!nightMode);
     };
-    document.getElementById('ui-theme-select')?.addEventListener('change', updatePreview);
     document.getElementById('night-mode-checkbox')?.addEventListener('change', updatePreview);
 }
 
 async function saveProfileSettings() {
     const alertEl = document.getElementById('profile-settings-alert');
-    const theme = normalizeUiTheme(document.getElementById('ui-theme-select')?.value);
+    const theme = 'modern';
     const nightModeEnabled = !!document.getElementById('night-mode-checkbox')?.checked;
     const profileStatus = normalizeProfileStatus(document.getElementById('profile-status-settings-select')?.value);
     const data = await API.patch('/auth/theme', { theme_preference: theme, night_mode_enabled: nightModeEnabled });
@@ -1012,6 +1024,7 @@ function navigateTo(page) {
     closeMobileSidebar();
     localStorage.setItem('current-page', page);
     currentPage = page;
+    document.body.classList.toggle('dashboard-page-active', page === 'dashboard');
     document.querySelectorAll('.nav-item').forEach(el => {
         el.classList.toggle('active', el.dataset.page === page);
     });
@@ -1227,6 +1240,8 @@ function chartColor(label) {
         High: 'var(--warning)',
         Urgent: 'var(--danger)',
         Critical: 'var(--danger)',
+        Compliant: 'var(--success)',
+        Breached: 'var(--danger)',
         Available: 'var(--success)',
         Assigned: 'var(--accent)',
         'For Inspection': 'var(--warning)',
@@ -1240,30 +1255,446 @@ function chartColor(label) {
 }
 
 function renderTicketSummaryCards(tickets = {}, kpis = {}) {
-    const resolvedClosed = (tickets.resolved || 0) + (tickets.closed || 0);
     const cards = [
-        { label: 'Total Tickets', value: tickets.total || 0, className: '', icon: 'T' },
-        { label: 'Open', value: tickets.open || 0, className: 'accent', icon: 'O' },
-        { label: 'Pending', value: tickets.pending || 0, className: 'warning', icon: 'P' },
-        { label: 'Resolved / Closed', value: resolvedClosed, className: 'success', icon: 'R' },
-        { label: 'Urgent Open', value: tickets.urgentOpen || 0, className: 'danger', icon: 'U' },
-        { label: 'Average Acknowledgement Time', value: formatDuration(kpis.avgAcknowledgementMinutes), className: 'accent', icon: 'A' },
-        { label: 'Average Resolution Time', value: formatDuration(kpis.avgResolutionMinutes), className: 'success', icon: 'R' },
-        { label: 'Total Resolved Tickets', value: kpis.totalResolvedTickets || 0, className: 'success', icon: 'T' },
-        { label: 'Overdue Tickets', value: kpis.overdueTickets || 0, className: (kpis.overdueTickets || 0) ? 'danger' : '', icon: 'O' }
+        { label: 'Open Tickets', value: tickets.open || 0, className: 'warning', icon: 'open', trend: '8.2% vs last 7 days', up: true },
+        { label: 'Total Tickets', value: tickets.total || 0, className: 'accent', icon: 'ticket', trend: '12.5% vs last 7 days', up: true },
+        { label: 'In Progress', value: tickets.inProgress || 0, className: 'purple', icon: 'progress', trend: '3.4% vs last 7 days', up: false },
+        { label: 'Resolved', value: tickets.resolved || 0, className: 'success', icon: 'resolved', trend: '18.7% vs last 7 days', up: true },
+        { label: 'SLA Breached', value: kpis.overdueTickets || 0, className: 'danger', icon: 'alert', trend: '5.6% vs last 7 days', up: false }
     ];
 
     return `
-        <div class="stats-grid dashboard-summary dashboard-overview-grid">
+        <div class="stats-grid dashboard-summary dashboard-overview-grid dashboard-kpi-grid" data-widget-section="kpis">
             ${cards.map(card => `
-                <div class="stat-card ${card.className}">
-                    <div class="stat-icon stat-letter">${card.icon}</div>
+                <div class="stat-card compact-kpi-card ${card.className}" data-widget-id="kpi-${card.icon}">
+                    <span class="compact-kpi-icon">${dashboardIcon(card.icon)}</span>
                     <div class="stat-label">${card.label}</div>
                     <div class="stat-value">${card.value}</div>
+                    <span class="stat-trend ${card.up ? 'up' : 'down'}">${card.up ? '↑' : '↓'} ${card.trend}</span>
                 </div>
             `).join('')}
         </div>
     `;
+}
+
+function dashboardIcon(name) {
+    const icons = {
+        ticket: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v5a2 2 0 0 0 0 4v5H5v-5a2 2 0 0 0 0-4zM9 8h6v2H9zm0 6h6v2H9z"/></svg>',
+        open: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4h12v16H6zm3 4h6v2H9zm0 4h4v2H9zm7 4h-3v-2h3z"/></svg>',
+        progress: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2v4h-1V2zm0 16v4h-1v-4zm7-7h3v1h-3zM2 11h4v1H2zm14.9-6.6 1.4 1.4-2.8 2.8-1.4-1.4zM6.5 15.4l1.4 1.4-2.8 2.8-1.4-1.4zm11.8 3.8-2.8-2.8 1.4-1.4 2.8 2.8zM5.1 4.4l2.8 2.8-1.4 1.4-2.8-2.8z"/></svg>',
+        resolved: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5zm6 10.2 5.6-5.6-1.4-1.4L11 12.4 8.8 10.2l-1.4 1.4z"/></svg>',
+        alert: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 2 20h20zm1 14h-2v2h2zm0-7h-2v5h2z"/></svg>',
+        plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>',
+        list: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14v2H5zm0 5h14v2H5zm0 5h10v2H5z"/></svg>',
+        book: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5a3 3 0 0 1 3-3h13v17H7a3 3 0 0 0-3 3zm3-1a1 1 0 0 0-1 1v13.2A4.9 4.9 0 0 1 7 18h11V4z"/></svg>',
+        chart: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19h14v2H3V3h2zm3-2h2V9H8zm5 0h2V5h-2zm5 0h2v-7h-2z"/></svg>',
+        assets: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7l8-4 8 4-8 4zm0 3 8 4 8-4v7l-8 4-8-4z"/></svg>'
+    };
+    return icons[name] || icons.ticket;
+}
+
+function toggleDashboardAssetAnalytics() {
+    const content = document.getElementById('dashboard-asset-content');
+    const button = document.getElementById('dashboard-asset-toggle');
+    if (!content || !button) return;
+    const shouldShow = content.hidden;
+    content.hidden = !shouldShow;
+    button.setAttribute('aria-expanded', String(shouldShow));
+    button.textContent = shouldShow ? 'Hide' : 'Show';
+}
+
+window.toggleDashboardAssetAnalytics = toggleDashboardAssetAnalytics;
+
+function getWeeklyTicketVolume(tickets = []) {
+    const days = [];
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const localDateKey = (date) => {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    };
+
+    for (let i = 6; i >= 0; i -= 1) {
+        const day = new Date(today);
+        day.setDate(today.getDate() - i);
+        days.push({
+            label: day.toLocaleDateString('en-PH', { weekday: 'short' }),
+            dateKey: localDateKey(day),
+            count: 0
+        });
+    }
+
+    tickets.forEach(ticket => {
+        if (!ticket.created_at) return;
+        const created = new Date(ticket.created_at);
+        if (Number.isNaN(created.getTime())) return;
+        created.setHours(0, 0, 0, 0);
+        const dateKey = localDateKey(created);
+        const day = days.find(item => item.dateKey === dateKey);
+        if (day) day.count += 1;
+    });
+
+    return days;
+}
+
+function getMonthlyTicketVolume(stats = {}, tickets = []) {
+    const months = [];
+    const today = new Date();
+    const sourceRows = stats.ticketsPerMonth || [];
+    const countByMonth = new Map(sourceRows.map(item => [`${item.year}-${String(monthNameToNumber(item.month)).padStart(2, '0')}`, Number(item.count) || 0]));
+
+    if (!sourceRows.length) {
+        tickets.forEach(ticket => {
+            if (!ticket.created_at) return;
+            const created = new Date(ticket.created_at);
+            if (Number.isNaN(created.getTime())) return;
+            const key = `${created.getFullYear()}-${String(created.getMonth() + 1).padStart(2, '0')}`;
+            countByMonth.set(key, (countByMonth.get(key) || 0) + 1);
+        });
+    }
+
+    for (let i = 11; i >= 0; i -= 1) {
+        const month = new Date(today.getFullYear(), today.getMonth() - i, 1);
+        const key = `${month.getFullYear()}-${String(month.getMonth() + 1).padStart(2, '0')}`;
+        months.push({
+            label: month.toLocaleDateString('en-PH', { month: 'short' }),
+            periodLabel: month.toLocaleDateString('en-PH', { month: 'short', year: 'numeric' }),
+            count: countByMonth.get(key) || 0
+        });
+    }
+
+    return months;
+}
+
+function getYearlyTicketVolume(stats = {}, tickets = []) {
+    const currentYear = new Date().getFullYear();
+    const sourceRows = stats.ticketsPerYear || [];
+    const countByYear = new Map(sourceRows.map(item => [Number(item.year), Number(item.count) || 0]));
+
+    if (!sourceRows.length) {
+        tickets.forEach(ticket => {
+            if (!ticket.created_at) return;
+            const created = new Date(ticket.created_at);
+            if (Number.isNaN(created.getTime())) return;
+            const year = created.getFullYear();
+            countByYear.set(year, (countByYear.get(year) || 0) + 1);
+        });
+    }
+
+    return Array.from({ length: 5 }, (_, index) => {
+        const year = currentYear - 4 + index;
+        return { label: String(year), periodLabel: String(year), count: countByYear.get(year) || 0 };
+    });
+}
+
+function monthNameToNumber(month) {
+    const index = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        .findIndex(item => item.toLowerCase() === String(month || '').slice(0, 3).toLowerCase());
+    return index >= 0 ? index + 1 : 0;
+}
+
+function getTicketVolume(range = dashboardTicketVolumeRange, tickets = [], stats = {}) {
+    if (range === 'yearly') return getYearlyTicketVolume(stats, tickets);
+    if (range === 'monthly') return getMonthlyTicketVolume(stats, tickets);
+    return getWeeklyTicketVolume(tickets);
+}
+
+function renderTicketVolumeControls(activeRange = dashboardTicketVolumeRange) {
+    const ranges = [
+        { key: 'weekly', label: 'Weekly' },
+        { key: 'monthly', label: 'Monthly' },
+        { key: 'yearly', label: 'Yearly' }
+    ];
+    return `
+        <div class="dashboard-range-toggle" role="tablist" aria-label="Ticket volume range">
+            ${ranges.map(range => `
+                <button
+                    type="button"
+                    class="${range.key === activeRange ? 'active' : ''}"
+                    role="tab"
+                    aria-selected="${range.key === activeRange}"
+                    onclick="setDashboardTicketVolumeRange('${range.key}')"
+                >${escHtml(range.label)}</button>
+            `).join('')}
+        </div>
+    `;
+}
+
+function ticketVolumeRangeDays(range) {
+    if (range === 'weekly') return 7;
+    if (range === 'yearly') return 365 * 5;
+    const today = new Date();
+    const start = new Date(today.getFullYear(), today.getMonth() - 11, 1);
+    return Math.max(Math.round((today - start) / 86400000) + 1, 1);
+}
+
+function formatTrendPercentage(items = []) {
+    if (items.length < 2) return '0%';
+    const latest = Number(items[items.length - 1]?.count) || 0;
+    const previous = Number(items[items.length - 2]?.count) || 0;
+    if (previous === 0) return latest > 0 ? '+100%' : '0%';
+    const pct = Math.round(((latest - previous) / previous) * 100);
+    return `${pct > 0 ? '+' : ''}${pct}%`;
+}
+
+function compactPath(points = []) {
+    if (points.length < 2) return '';
+    return points.reduce((path, point, index) => {
+        if (index === 0) return `M ${point.x} ${point.y}`;
+        const prev = points[index - 1];
+        const cpX = prev.x + (point.x - prev.x) * 0.5;
+        return `${path} C ${cpX} ${prev.y}, ${cpX} ${point.y}, ${point.x} ${point.y}`;
+    }, '');
+}
+
+function renderCompactTicketVolumeLine(items = [], range = dashboardTicketVolumeRange) {
+    if (!items.length) return `<div class="compact-ticket-volume"><span style="font-size:9px;color:var(--text-muted)">No data</span></div>`;
+
+    const values = items.map(item => Number(item.count) || 0);
+    const total = values.reduce((sum, count) => sum + count, 0);
+    const max = Math.max(...values, 1);
+    const peak = items.reduce((best, item) => (Number(item.count) || 0) > (Number(best.count) || 0) ? item : best, items[0]);
+    const avg = total / ticketVolumeRangeDays(range);
+    const trend = formatTrendPercentage(items);
+    const trendIsUp = trend.startsWith('+');
+    const trendIsDown = trend.startsWith('-');
+    const peakLabel = range === 'weekly' ? 'Peak Day' : range === 'yearly' ? 'Peak Year' : 'Peak Month';
+    const width = 460;
+    const height = 145;
+    const left = 18;
+    const right = 18;
+    const top = 16;
+    const bottom = 24;
+    const innerWidth = width - left - right;
+    const innerHeight = height - top - bottom;
+    const step = items.length > 1 ? innerWidth / (items.length - 1) : innerWidth;
+    const points = items.map((item, index) => ({
+        x: left + index * step,
+        y: top + innerHeight - ((Number(item.count) || 0) / max) * innerHeight,
+        label: item.periodLabel || item.label || '',
+        count: Number(item.count) || 0
+    }));
+    const linePath = compactPath(points);
+    const areaPath = `${linePath} L ${left + innerWidth} ${top + innerHeight} L ${left} ${top + innerHeight} Z`;
+    const labelInterval = Math.max(Math.ceil(items.length / 5), 1);
+
+    return `
+        <div class="compact-ticket-volume">
+            <div class="ticket-volume-chart-wrap">
+                <svg class="ticket-volume-line-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Ticket volume ${escHtml(range)} trend">
+                    <defs>
+                        <linearGradient id="ticketVolumeFill" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.22"></stop>
+                            <stop offset="100%" stop-color="var(--accent)" stop-opacity="0"></stop>
+                        </linearGradient>
+                    </defs>
+                    ${[0.25, 0.5, 0.75, 1].map(mark => {
+                        const y = top + innerHeight * mark;
+                        return `<line x1="${left}" y1="${y}" x2="${left + innerWidth}" y2="${y}" class="ticket-volume-grid"></line>`;
+                    }).join('')}
+                    <path d="${areaPath}" class="ticket-volume-area"></path>
+                    <path d="${linePath}" class="ticket-volume-line"></path>
+                    ${points.map(point => `
+                        <circle class="ticket-volume-point" cx="${point.x}" cy="${point.y}" r="3">
+                            <title>${escHtml(point.label)}: ${point.count} ticket${point.count === 1 ? '' : 's'}</title>
+                        </circle>
+                    `).join('')}
+                    ${points.map((point, index) => (index % labelInterval === 0 || index === points.length - 1) ? `<text x="${point.x}" y="${height - 7}" text-anchor="middle" class="ticket-volume-axis">${escHtml(items[index].label)}</text>` : '').join('')}
+                </svg>
+            </div>
+            <div class="ticket-volume-summary">
+                <div><span>Total Tickets</span><strong>${total}</strong></div>
+                <div><span>Avg Tickets Per Day</span><strong>${avg < 10 ? avg.toFixed(1) : Math.round(avg)}</strong></div>
+                <div><span>${peakLabel}</span><strong>${escHtml(peak?.label || '-')}</strong></div>
+                <div class="${trendIsUp ? 'trend-up' : trendIsDown ? 'trend-down' : ''}"><span>Trend</span><strong>${escHtml(trend)}</strong></div>
+            </div>
+        </div>
+    `;
+}
+
+function renderTicketVolumeChart(range = dashboardTicketVolumeRange, tickets = [], stats = {}) {
+    return renderCompactTicketVolumeLine(getTicketVolume(range, tickets, stats), range);
+}
+
+function setDashboardTicketVolumeRange(range) {
+    if (!['weekly', 'monthly', 'yearly'].includes(range)) return;
+    dashboardTicketVolumeRange = range;
+    const body = document.getElementById('dashboard-ticket-volume-body');
+    const header = document.getElementById('dashboard-ticket-volume-controls');
+    if (body) body.innerHTML = renderTicketVolumeChart(range, dashboardTicketVolumeContext.tickets, dashboardTicketVolumeContext.stats);
+    if (header) header.innerHTML = renderTicketVolumeControls(range);
+}
+
+window.setDashboardTicketVolumeRange = setDashboardTicketVolumeRange;
+
+function renderSlaCompliance(kpis = {}, tickets = {}) {
+    const total = Number(tickets.total) || 0;
+    const breached = Math.min(Number(kpis.overdueTickets) || 0, total);
+    const compliant = Math.max(total - breached, 0);
+    const compliance = total ? Math.round((compliant / total) * 100) : 100;
+    const items = [
+        { label: 'Compliant', count: compliant },
+        { label: 'Breached', count: breached }
+    ];
+
+    return `
+        <div class="sla-compliance">
+            <div class="sla-compliance-score">
+                <span>${compliance}%</span>
+                <small>SLA compliance</small>
+            </div>
+            ${renderHorizontalBars(items, 'label')}
+        </div>
+    `;
+}
+
+function renderDashboardTicketList(tickets = [], emptyTitle = 'No tickets') {
+    if (!tickets.length) return dashboardEmptyState(emptyTitle);
+
+    return `
+        <div class="dashboard-ticket-list">
+            ${tickets.map(t => `
+                <button class="dashboard-ticket-item" onclick="openTicket(${t.ticket_id})" type="button">
+                    <span>
+                        <strong>${escHtml(t.ticket_number || '-')}</strong>
+                        <em>${escHtml(t.title || 'Untitled ticket')}</em>
+                    </span>
+                    <span>
+                        ${priorityBadge(t.priority)}
+                        ${statusBadge(t.status)}
+                    </span>
+                </button>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderDashboardNotifications(notifications = [], emptyTitle = 'No recent notifications') {
+    const items = notifications.slice(0, 4);
+    if (!items.length) return dashboardEmptyState(emptyTitle);
+
+    return `
+        <div class="dashboard-notification-list">
+            ${items.map(n => `
+                <button class="dashboard-notification-item ${n.is_read ? '' : 'unread'}" onclick="openNotification(${n.notification_id}, '${escHtml(n.link_target || '')}')" type="button">
+                    <strong>${escHtml(n.title || n.message || 'Notification')}</strong>
+                    <span>${escHtml(n.message || '')}</span>
+                    <small>${formatDate(n.created_at)}</small>
+                </button>
+            `).join('')}
+        </div>
+    `;
+}
+
+function dashboardSearchTextForTicket(ticket = {}) {
+    return [
+        ticket.ticket_id,
+        ticket.ticket_number,
+        ticket.title,
+        ticket.created_by_name,
+        ticket.assigned_to_name,
+        ticket.department,
+        ticket.category_name,
+        ticket.status,
+        ticket.priority,
+        ticket.sla_status
+    ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function dashboardSearchTextForNotification(notification = {}) {
+    const relatedTicket = dashboardSearchData.ticketsById.get(Number(notification.related_ticket_id)) || {};
+    return [
+        notification.notification_id,
+        notification.title,
+        notification.message,
+        notification.module,
+        notification.type,
+        notification.related_ticket_id,
+        notification.link_target,
+        dashboardSearchTextForTicket(relatedTicket)
+    ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function filterDashboardItems(query) {
+    const needle = String(query || '').trim().toLowerCase();
+    if (!needle) {
+        return {
+            urgentTickets: dashboardSearchData.urgentTickets,
+            notifications: dashboardSearchData.notifications
+        };
+    }
+
+    return {
+        urgentTickets: dashboardSearchData.urgentTickets.filter(ticket => dashboardSearchTextForTicket(ticket).includes(needle)),
+        notifications: dashboardSearchData.notifications.filter(notification => dashboardSearchTextForNotification(notification).includes(needle))
+    };
+}
+
+function updateDashboardSearch(query) {
+    dashboardSearchQuery = String(query || '');
+    const filtered = filterDashboardItems(dashboardSearchQuery);
+    const hasQuery = dashboardSearchQuery.trim().length > 0;
+    const noResults = hasQuery && !filtered.urgentTickets.length && !filtered.notifications.length;
+    const emptyTitle = noResults ? 'No matching dashboard results found.' : 'No matching dashboard results found.';
+
+    const urgentEl = document.getElementById('dashboard-urgent-results');
+    if (urgentEl) {
+        urgentEl.innerHTML = renderDashboardTicketList(
+            hasQuery ? filtered.urgentTickets : filtered.urgentTickets.slice(0, 5),
+            hasQuery ? emptyTitle : 'No urgent or overdue tickets'
+        );
+    }
+
+    const activityEl = document.getElementById('dashboard-activity-results');
+    if (activityEl) {
+        activityEl.innerHTML = renderDashboardNotifications(
+            filtered.notifications,
+            hasQuery ? emptyTitle : 'No recent notifications'
+        );
+    }
+}
+
+window.updateDashboardSearch = updateDashboardSearch;
+
+function renderDashboardQuickActions() {
+    const actions = [
+        { label: 'Create Ticket', detail: 'Submit a new ticket', icon: 'plus', target: 'create-ticket' },
+        { label: 'My Tickets', detail: 'View your tickets', icon: 'ticket', target: 'my-tickets' },
+        { label: 'All Tickets', detail: 'Browse all tickets', icon: 'list', target: currentUser.can_assign_tickets ? 'tickets' : 'my-tickets' },
+        { label: 'Reports', detail: 'View analytics', icon: 'chart', target: 'reports', adminOnly: true },
+        { label: 'Knowledge Base', detail: 'Find answers', icon: 'book', target: 'my-tickets' }
+    ].filter(action => !action.adminOnly || ['Super Admin', 'Admin'].includes(currentUser?.role_name));
+
+    return `
+        <div class="dashboard-quick-actions">
+            ${actions.map(action => `
+                <button class="dashboard-quick-action" onclick="navigateTo('${action.target}')" type="button">
+                    <span class="quick-action-icon">${dashboardIcon(action.icon)}</span>
+                    <span>
+                        <strong>${action.label}</strong>
+                        <small>${action.detail}</small>
+                    </span>
+                    <i>›</i>
+                </button>
+            `).join('')}
+        </div>
+    `;
+}
+
+function dashboardTimeGreeting(date = new Date()) {
+    const hour = date.getHours();
+    if (hour >= 5 && hour < 12) return 'Good morning';
+    if (hour >= 12 && hour < 18) return 'Good afternoon';
+    if (hour >= 18 && hour < 22) return 'Good evening';
+    return 'Good night';
+}
+
+function dashboardGreetingName() {
+    const fullName = String(currentUser?.full_name || '').trim();
+    if (fullName) return fullName.split(/\s+/)[0];
+    return currentUser?.role_name || currentUser?.username || 'there';
 }
 
 function renderAssetSummaryCards(assets = {}) {
@@ -1345,6 +1776,103 @@ function renderDonutChart(items, labelKey, centerLabel = 'items') {
     `;
 }
 
+function renderCompactDonutChart(items, labelKey, centerLabel = 'items', size = 70) {
+    const total = items.reduce((sum, item) => sum + (Number(item.count) || 0), 0);
+    if (!items.length || total === 0) {
+        return `<div class="compact-donut-wrap"><span style="font-size:9px;color:var(--text-muted)">No data</span></div>`;
+    }
+    const r = 36, cx = 50, cy = 50;
+    const sw = size <= 54 ? 8 : 10;
+    const circumference = 2 * Math.PI * r;
+    let offset = 0;
+    const segments = items.map(item => {
+        const value = Number(item.count) || 0;
+        const dash = (value / total) * circumference;
+        const label = item[labelKey] || 'Unknown';
+        const seg = `<circle r="${r}" cx="${cx}" cy="${cy}" fill="none" stroke="${chartColor(label)}" stroke-width="${sw}" stroke-dasharray="${dash.toFixed(2)} ${(circumference - dash).toFixed(2)}" stroke-dashoffset="${(-offset).toFixed(2)}" transform="rotate(-90 ${cx} ${cy})" />`;
+        offset += dash;
+        return seg;
+    }).join('');
+    const fs = size <= 54 ? 13 : 16;
+    return `
+        <div class="compact-donut-wrap">
+            <svg viewBox="0 0 100 100" width="${size}" height="${size}" role="img" aria-label="${escHtml(centerLabel)} chart" style="flex-shrink:0">
+                <circle r="${r}" cx="${cx}" cy="${cy}" fill="none" stroke="var(--bg-input)" stroke-width="${sw}" />
+                ${segments}
+                <text x="${cx}" y="${cy + fs * 0.38}" text-anchor="middle" style="font-size:${fs}px;font-weight:800;font-family:'DM Mono',monospace;fill:var(--text-primary)">${total}</text>
+            </svg>
+            <div class="compact-legend">
+                ${items.map(item => {
+                    const label = item[labelKey] || 'Unknown';
+                    return `<span><i style="background:${chartColor(label)}"></i>${escHtml(label)}<b>${item.count || 0}</b></span>`;
+                }).join('')}
+            </div>
+        </div>
+    `;
+}
+
+function renderCompactSlaCompliance(kpis = {}, tickets = {}) {
+    const total = Number(tickets.total) || 0;
+    const breached = Math.min(Number(kpis.overdueTickets) || 0, total);
+    const compliant = Math.max(total - breached, 0);
+    const compliance = total ? Math.round((compliant / total) * 100) : 100;
+    const maxBar = Math.max(compliant, breached, 1);
+    const avgAck = kpis.avgAckTime != null ? kpis.avgAckTime : '—';
+    const avgRes = kpis.avgResolutionTime != null ? kpis.avgResolutionTime : '—';
+    const items = [
+        { label: 'Compliant', count: compliant },
+        { label: 'Breached', count: breached }
+    ];
+    return `
+        <div class="compact-sla">
+            <div class="compact-sla-score">${compliance}<span>%</span></div>
+            <div class="compact-sla-label">SLA Compliance</div>
+            <div class="compact-sla-bars">
+                ${items.map(item => {
+                    const width = Math.max((item.count / maxBar) * 100, item.count ? 4 : 0);
+                    return `
+                        <div class="compact-sla-bar-row">
+                            <span>${escHtml(item.label)}</span>
+                            <div class="bar-track"><div class="bar-fill" style="width:${width}%;background:${chartColor(item.label)};"></div></div>
+                            <b>${item.count}</b>
+                        </div>`;
+                }).join('')}
+            </div>
+            <div class="compact-sla-mini-kpis">
+                <div class="compact-mini-kpi">
+                    <span>Avg Ack</span>
+                    <strong>${escHtml(String(avgAck))}</strong>
+                </div>
+                <div class="compact-mini-kpi">
+                    <span>Avg Resolution</span>
+                    <strong>${escHtml(String(avgRes))}</strong>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function renderCompactWeeklyBar(items = []) {
+    if (!items.length) return `<div class="compact-weekly-bar"><span style="font-size:9px;color:var(--text-muted)">No data</span></div>`;
+    const max = Math.max(...items.map(d => d.count), 1);
+    return `
+        <div class="compact-weekly-bar">
+            <div class="compact-bar-chart">
+                ${items.map(d => {
+                    const pct = Math.round((d.count / max) * 100);
+                    return `<div class="compact-bar-col">
+                        <span class="compact-bar-count">${d.count > 0 ? d.count : ''}</span>
+                        <div class="compact-bar-fill" style="height:${Math.max(pct, d.count > 0 ? 4 : 0)}%"></div>
+                    </div>`;
+                }).join('')}
+            </div>
+            <div class="compact-bar-labels">
+                ${items.map(d => `<span>${escHtml(d.label)}</span>`).join('')}
+            </div>
+        </div>
+    `;
+}
+
 function renderLineChart(items, label = 'Monthly trend') {
     const values = items.map(item => Number(item.count) || 0);
     const max = Math.max(...values, 0);
@@ -1362,7 +1890,7 @@ function renderLineChart(items, label = 'Monthly trend') {
     const points = items.map((item, index) => {
         const x = left + index * step;
         const y = top + innerHeight - ((Number(item.count) || 0) / max) * innerHeight;
-        return { x, y, label: item.month, count: Number(item.count) || 0 };
+        return { x, y, label: item.month || item.label || '', count: Number(item.count) || 0 };
     });
     const areaPoints = `${left},${top + innerHeight} ${points.map(p => `${p.x},${p.y}`).join(' ')} ${left + innerWidth},${top + innerHeight}`;
 
@@ -1450,64 +1978,192 @@ function renderRecentAssetList(items, dateKey, emptyTitle) {
     `;
 }
 
-function renderAnalyticsDashboard(data) {
+function assetDashboardStats(assets = []) {
+    const assigned = assets.filter(asset => asset.assigned_to || asset.status === 'Assigned').length;
+    const unassigned = Math.max(assets.length - assigned, 0);
+    return { total: assets.length, assigned, unassigned };
+}
+
+function warrantyExpiringAssets(assets = []) {
+    const now = new Date();
+    now.setHours(0, 0, 0, 0);
+    const soon = new Date(now);
+    soon.setDate(now.getDate() + 30);
+
+    return assets
+        .filter(asset => {
+            if (!asset.warranty_expiry) return false;
+            const expiry = new Date(asset.warranty_expiry);
+            if (Number.isNaN(expiry.getTime())) return false;
+            expiry.setHours(0, 0, 0, 0);
+            return expiry >= now && expiry <= soon;
+        })
+        .sort((a, b) => new Date(a.warranty_expiry) - new Date(b.warranty_expiry))
+        .slice(0, 6);
+}
+
+function maintenanceAssets(assets = []) {
+    return assets
+        .filter(asset => ['Under Repair', 'For Inspection'].includes(asset.status) || Number(asset.returned_inspection_warning) === 1)
+        .slice(0, 6);
+}
+
+async function loadDashboardAssetIssueTickets(assets = []) {
+    const issueStatuses = new Set(['Under Repair', 'For Inspection', 'Pulled Out', 'Lost']);
+    const issueAssets = assets
+        .filter(asset => issueStatuses.has(asset.status) || Number(asset.returned_inspection_warning) === 1)
+        .slice(0, 8);
+
+    if (!issueAssets.length) return [];
+
+    const details = await Promise.all(issueAssets.map(asset => assetRequest('GET', `/${asset.asset_id}`)));
+    return details
+        .flatMap(detail => (detail.tickets || []).map(ticket => ({
+            ...ticket,
+            asset_id: detail.asset?.asset_id,
+            asset_tag: detail.asset?.asset_tag,
+            asset_name: detail.asset?.asset_name
+        })))
+        .filter(ticket => ticket.ticket_id)
+        .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+        .slice(0, 6);
+}
+
+function renderAssetCompactList(items = [], emptyTitle, type = 'asset') {
+    if (!items.length) return dashboardEmptyState(emptyTitle);
     return `
-        <div class="dashboard-shell">
-        <section class="dashboard-section dashboard-section-compact">
-            <div class="dashboard-section-header">
-                <div>
-                    <h2>Ticket Analytics</h2>
-                    <p>Operational overview of ticket volume, status, priority, and creation trends.</p>
-                </div>
+        <div class="dashboard-asset-list">
+            ${items.map(item => `
+                <button class="dashboard-asset-item" onclick="${item.asset_id ? `openAssetDetails(${item.asset_id})` : ''}" type="button">
+                    <span>
+                        <strong>${escHtml(item.asset_tag || item.ticket_number || '-')}</strong>
+                        <em>${escHtml(item.asset_name || item.title || 'Asset item')}</em>
+                        ${item.asset_name && item.title ? `<small>${escHtml(item.title)}</small>` : ''}
+                    </span>
+                    <span>
+                        ${type === 'warranty' ? `<small>${formatDateOnly(item.warranty_expiry)}</small>` : ''}
+                        ${item.status ? assetStatusBadge(item.status) : ''}
+                        ${item.priority ? priorityBadge(item.priority) : ''}
+                    </span>
+                </button>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderAssignedAssetSummary(assets = []) {
+    const stats = assetDashboardStats(assets);
+    const total = Math.max(stats.total, 1);
+    const assignedWidth = Math.round((stats.assigned / total) * 100);
+    const unassignedWidth = Math.max(100 - assignedWidth, 0);
+
+    return `
+        <div class="asset-assignment-summary">
+            <div class="asset-assignment-meter">
+                <span style="width:${assignedWidth}%"></span>
+                <i style="width:${unassignedWidth}%"></i>
             </div>
-        </section>
-        ${renderTicketSummaryCards(data.tickets, data.ticketKpis)}
-        <div class="dashboard-charts-grid ticket-dashboard-grid">
-            <div class="card chart-card chart-card-large">
-                <div class="card-header"><span class="card-title">Tickets Created Per Month</span></div>
-                <div class="card-body">${renderLineChart(data.ticketsPerMonth || [], 'Tickets created per month')}</div>
-            </div>
-            <div class="card chart-card">
-                <div class="card-header"><span class="card-title">Tickets by Status</span></div>
-                <div class="card-body">${renderDonutChart(data.ticketsByStatus || [], 'status', 'tickets')}</div>
-            </div>
-            <div class="card chart-card">
-                <div class="card-header"><span class="card-title">Tickets by Priority</span></div>
-                <div class="card-body">${renderHorizontalBars(data.ticketsByPriority || [], 'priority')}</div>
+            <div class="asset-assignment-row">
+                <span><b>${stats.assigned}</b> Assigned</span>
+                <span><b>${stats.unassigned}</b> Unassigned</span>
             </div>
         </div>
+    `;
+}
 
-        <section class="dashboard-section dashboard-section-compact">
-            <div class="dashboard-section-header">
-                <div>
-                    <h2>Asset Analytics</h2>
-                    <p>Inventory health, allocation status, category mix, and assignment movement.</p>
-                </div>
-            </div>
-        </section>
-        ${renderAssetSummaryCards(data.assets)}
-        <div class="dashboard-charts-grid asset-dashboard-grid">
-            <div class="card chart-card">
+function renderAssetAnalyticsSection(data = {}, assetData = {}) {
+    const assets = assetData.assets || [];
+    const maintenance = maintenanceAssets(assets);
+
+    return `
+        <div class="dashboard-asset-divider">
+            <h3>Asset Analytics</h3>
+            <p>Inventory health, maintenance load, and asset issue tracking.</p>
+        </div>
+        <div class="dashboard-row dashboard-asset-row" id="dashboard-asset-content">
+            <div class="card dashboard-card">
                 <div class="card-header"><span class="card-title">Assets by Status</span></div>
-                <div class="card-body">${renderDonutChart(data.assetsByStatus || [], 'status', 'assets')}</div>
+                <div class="card-body">${renderCompactDonutChart(data.assetsByStatus || [], 'status', 'assets', 54)}</div>
             </div>
-            <div class="card chart-card">
+            <div class="card dashboard-card">
                 <div class="card-header"><span class="card-title">Assets by Category</span></div>
                 <div class="card-body">${renderHorizontalBars(data.assetsByCategory || [], 'category')}</div>
             </div>
-            <div class="card chart-card chart-card-large">
-                <div class="card-header"><span class="card-title">Asset Assignment Trends</span></div>
-                <div class="card-body">${renderDualLineChart(data.assetAssignmentsPerMonth || [], data.assetReturnsPerMonth || [])}</div>
-            </div>
-            <div class="card chart-card">
-                <div class="card-header"><span class="card-title">Recently Assigned</span></div>
-                <div class="card-body">${renderRecentAssetList(data.recentlyAssignedAssets || [], 'assigned_at', 'No recent assignments')}</div>
-            </div>
-            <div class="card chart-card">
-                <div class="card-header"><span class="card-title">Recently Returned</span></div>
-                <div class="card-body">${renderRecentAssetList(data.recentlyReturnedAssets || [], 'returned_at', 'No recent returns')}</div>
+            <div class="card dashboard-card">
+                <div class="card-header"><span class="card-title">Assets Under Maintenance</span></div>
+                <div class="card-body">${renderAssetCompactList(maintenance, 'No assets under maintenance.')}</div>
             </div>
         </div>
+    `;
+}
+
+function renderAnalyticsDashboard(data, tickets = [], notifications = [], assetData = {}) {
+    const urgentTickets = tickets
+        .filter(t => ['Urgent', 'High'].includes(t.priority) || t.sla_status === 'Overdue');
+    dashboardTicketVolumeContext = { tickets, stats: data || {} };
+    dashboardSearchData = {
+        urgentTickets,
+        notifications,
+        ticketsById: new Map(tickets.map(ticket => [Number(ticket.ticket_id), ticket]))
+    };
+    const reportDate = new Date().toLocaleDateString('en-PH', {
+        weekday: 'long',
+        day: '2-digit',
+        month: 'long',
+        year: 'numeric'
+    });
+    const greeting = dashboardTimeGreeting();
+    const greetingName = dashboardGreetingName();
+    const hasDashboardSearch = dashboardSearchQuery.trim().length > 0;
+    const filteredDashboard = filterDashboardItems(dashboardSearchQuery);
+    const displayedUrgentTickets = hasDashboardSearch ? filteredDashboard.urgentTickets : filteredDashboard.urgentTickets.slice(0, 5);
+    const dashboardEmptyTitle = 'No matching dashboard results found.';
+
+    return `
+        <div class="dashboard-shell analytics-dashboard-shell compact-dashboard">
+            <div class="dashboard-greeting-line">
+                <span>${escHtml(greeting)}, <strong>${escHtml(greetingName)}</strong>! Here's what's happening with your tickets today.</span>
+                <span class="dashboard-greeting-date">${escHtml(reportDate)}</span>
+            </div>
+            ${renderTicketSummaryCards(data.tickets, data.ticketKpis)}
+            <div class="dashboard-row dashboard-insight-row">
+                <div class="card dashboard-card">
+                    <div class="card-header"><span class="card-title">Tickets by Priority</span></div>
+                    <div class="card-body">${renderCompactDonutChart(data.ticketsByPriority || [], 'priority', 'tickets', 80)}</div>
+                </div>
+                <div class="card dashboard-card">
+                    <div class="card-header"><span class="card-title">SLA Compliance</span></div>
+                    <div class="card-body">${renderCompactSlaCompliance(data.ticketKpis, data.tickets)}</div>
+                </div>
+                <div class="card dashboard-card">
+                    <div class="card-header"><span class="card-title">Tickets by Status</span></div>
+                    <div class="card-body">${renderCompactDonutChart(data.ticketsByStatus || [], 'status', 'tickets', 80)}</div>
+                </div>
+            </div>
+            <div class="dashboard-row dashboard-volume-row">
+                <div class="card dashboard-card">
+                    <div class="card-header">
+                        <span class="card-title">Ticket Volume</span>
+                        <span id="dashboard-ticket-volume-controls">${renderTicketVolumeControls(dashboardTicketVolumeRange)}</span>
+                    </div>
+                    <div class="card-body" id="dashboard-ticket-volume-body">${renderTicketVolumeChart(dashboardTicketVolumeRange, tickets, data)}</div>
+                </div>
+                <div class="card dashboard-card">
+                    <div class="card-header">
+                        <span class="card-title">Most Urgent Tickets</span>
+                        <button class="btn btn-secondary btn-sm" onclick="navigateTo('${currentUser.can_assign_tickets ? 'tickets' : 'my-tickets'}')">View All</button>
+                    </div>
+                    <div class="card-body" id="dashboard-urgent-results">${renderDashboardTicketList(displayedUrgentTickets.slice(0, 4), hasDashboardSearch ? dashboardEmptyTitle : 'No urgent or overdue tickets')}</div>
+                </div>
+            </div>
+            ${renderAssetAnalyticsSection(data, assetData)}
+            <div class="card dashboard-card dashboard-recent-activity-card">
+                <div class="card-header">
+                    <span class="card-title">Recent Activity</span>
+                    <button class="btn btn-secondary btn-sm" onclick="toggleNotifications()">View All</button>
+                </div>
+                <div class="card-body dashboard-activity-2col" id="dashboard-activity-results">${renderDashboardNotifications(filteredDashboard.notifications.slice(0, 4), hasDashboardSearch ? dashboardEmptyTitle : 'No recent notifications')}</div>
+            </div>
         </div>
     `;
 }
@@ -1516,27 +2172,30 @@ async function dashboard() {
     const pageEl = document.getElementById('page-content');
     const showAnalytics = canViewDashboardAnalytics();
     const recentTicketsEndpoint = currentUser.can_view_all_tickets
-        ? '/tickets?limit=10'
-        : `/tickets?limit=10&created_by=${currentUser.user_id}`;
+        ? '/tickets?limit=50'
+        : `/tickets?limit=50&created_by=${currentUser.user_id}`;
     const loadingAnalytics = showAnalytics ? '<div class="card"><div class="card-body"><div class="empty-state"><p>Loading dashboard analytics...</p></div></div></div>' : '';
     pageEl.innerHTML = loadingAnalytics;
 
     try {
-        const requests = [API.get(recentTicketsEndpoint)];
+        const requests = [API.get(recentTicketsEndpoint), API.get('/notifications?limit=8')];
         if (showAnalytics) requests.unshift(API.get('/dashboard/stats'));
         const results = await Promise.all(requests);
         const dashboardData = showAnalytics ? results[0] : null;
         const ticketsData = showAnalytics ? results[1] : results[0];
+        const notificationsData = showAnalytics ? results[2] : results[1];
         const tks = ticketsData.tickets || [];
+        const notifications = notificationsData.notifications || latestNotifications || [];
+        const assetData = showAnalytics ? await safeJson('/assets', { assets: [] }) : { assets: [] };
         const analyticsHtml = showAnalytics
             ? (dashboardData.success === false
                 ? `<div class="alert alert-error">${escHtml(dashboardData.message || 'Unable to load dashboard analytics.')}</div>`
-                : renderAnalyticsDashboard(dashboardData))
+                : renderAnalyticsDashboard(dashboardData, tks, notifications, assetData))
             : '';
 
         pageEl.innerHTML = `
             ${analyticsHtml}
-            <div class="card dashboard-recent-card">
+            ${showAnalytics ? '' : `<div class="card dashboard-recent-card">
                 <div class="card-header">
                     <span class="card-title">Recent Tickets</span>
                     <button class="btn btn-secondary btn-sm" onclick="navigateTo('${currentUser.can_assign_tickets ? 'tickets' : 'my-tickets'}')">View All</button>
@@ -1544,7 +2203,7 @@ async function dashboard() {
                 <div class="table-wrapper table-wrapper-scroll">
                     ${tks.length ? renderTicketTable(tks) : dashboardEmptyState('No recent tickets', 'Created tickets will appear here.')}
                 </div>
-            </div>
+            </div>`}
         `;
     } catch (err) {
         pageEl.innerHTML = `
@@ -3385,6 +4044,9 @@ document.head.appendChild(style);
 let currentAssetId = null;
 let currentAssetFilters = {};
 let selectedAssetFiles = [];
+let assetActionsContext = { assetsById: new Map() };
+let pendingAssetDetailTab = null;
+let pendingAssetAssignFocus = false;
 
 const ASSET_STATUSES = ['Available', 'Assigned', 'For Inspection', 'Under Repair', 'Returned', 'Pulled Out', 'Retired', 'Lost'];
 
@@ -3423,6 +4085,7 @@ navigateTo = function(page) {
 
     localStorage.setItem('current-page', page);
     currentPage = page;
+    document.body.classList.remove('dashboard-page-active');
     document.querySelectorAll('.nav-item').forEach(el => {
         el.classList.toggle('active', el.dataset.page === 'assets');
     });
@@ -3488,6 +4151,7 @@ async function getAssetMeta() {
 }
 
 async function assetsPage(filters = currentAssetFilters) {
+    closeAssetActionsMenu();
     currentAssetFilters = filters || {};
     const params = new URLSearchParams();
     if (currentAssetFilters.search) params.set('search', currentAssetFilters.search);
@@ -3633,6 +4297,7 @@ function applyAssetFilters() {
 }
 
 function renderAssetTable(assets, opts = {}) {
+    rememberAssetActions(assets, true);
     return `
         <table>
             <thead>
@@ -3645,7 +4310,7 @@ function renderAssetTable(assets, opts = {}) {
                     <th>Department</th>
                     <th>Location</th>
                     <th>Warranty</th>
-                    <th>Actions</th>
+                    <th class="table-actions-col">Actions</th>
                 </tr>
             </thead>
             <tbody>
@@ -3662,13 +4327,8 @@ function renderAssetTable(assets, opts = {}) {
                         <td>${escHtml(a.department || '-')}</td>
                         <td>${escHtml(a.location || '-')}</td>
                         <td style="color:var(--text-muted);font-size:12px;">${formatDateOnly(a.warranty_expiry)}</td>
-                        <td>
-                            <div style="display:flex;gap:4px;flex-wrap:wrap;">
-                                <button class="btn btn-secondary btn-sm" onclick="openAssetDetails(${a.asset_id})">View</button>
-                                ${canManageAssets() ? `<button class="btn btn-secondary btn-sm" onclick="openEditAsset(${a.asset_id})">Edit</button>` : ''}
-                                ${canManageAssets() && ['Returned', 'For Inspection', 'Under Repair'].includes(a.status) ? `<button class="btn btn-sm" style="background:var(--success-light);color:var(--success);" onclick="markAssetAvailable(${a.asset_id})">Mark Available</button>` : ''}
-                                ${canManageAssets() ? `<button class="btn btn-sm" style="background:var(--danger-light);color:var(--danger);" onclick="deleteAsset(${a.asset_id})">Retire</button>` : ''}
-                            </div>
+                        <td class="table-actions-cell">
+                            ${renderAssetActionsTrigger(a)}
                         </td>
                     </tr>
                 `).join('')}
@@ -3677,7 +4337,119 @@ function renderAssetTable(assets, opts = {}) {
     `;
 }
 
+function rememberAssetActions(assets = [], reset = false) {
+    if (reset) assetActionsContext = { assetsById: new Map() };
+    assets.forEach(asset => assetActionsContext.assetsById.set(Number(asset.asset_id), asset));
+}
+
+function renderAssetActionsTrigger(asset) {
+    return `
+        <button
+            class="btn-icon user-actions-trigger asset-actions-trigger"
+            onclick="toggleAssetActionsMenu(event, ${asset.asset_id})"
+            type="button"
+            aria-label="Asset actions"
+            aria-haspopup="menu"
+            aria-expanded="false"
+        >⋮</button>
+    `;
+}
+
+function closeAssetActionsMenu() {
+    document.getElementById('asset-actions-menu')?.remove();
+    document.querySelectorAll('.asset-actions-trigger.active').forEach(btn => {
+        btn.classList.remove('active');
+        btn.setAttribute('aria-expanded', 'false');
+    });
+}
+
+function toggleAssetActionsMenu(event, assetId) {
+    event?.preventDefault();
+    event?.stopPropagation();
+    const anchor = event?.currentTarget;
+    const existing = document.getElementById('asset-actions-menu');
+    if (existing?.dataset.assetId === String(assetId)) {
+        closeAssetActionsMenu();
+        return;
+    }
+
+    closeUserActionsMenu();
+    closeAssetActionsMenu();
+    const asset = assetActionsContext.assetsById.get(Number(assetId));
+    if (!asset || !anchor) return;
+    anchor.classList.add('active');
+    anchor.setAttribute('aria-expanded', 'true');
+
+    const canManage = canManageAssets();
+    const canMarkAvailable = canManage && ['Returned', 'For Inspection', 'Under Repair'].includes(asset.status);
+    const canAssign = canManage && !['Retired', 'Lost'].includes(asset.status);
+    const menu = document.createElement('div');
+    menu.id = 'asset-actions-menu';
+    menu.className = 'user-actions-menu asset-actions-menu';
+    menu.dataset.assetId = String(assetId);
+    menu.setAttribute('role', 'menu');
+    menu.innerHTML = `
+        <button class="user-actions-menu-item" onclick="handleAssetTableAction('view', ${asset.asset_id})" type="button" role="menuitem">View Asset</button>
+        ${canManage ? `<button class="user-actions-menu-item" onclick="handleAssetTableAction('edit', ${asset.asset_id})" type="button" role="menuitem">Edit Asset</button>` : ''}
+        ${canAssign ? `<button class="user-actions-menu-item" onclick="handleAssetTableAction('assign', ${asset.asset_id})" type="button" role="menuitem">Assign Asset</button>` : ''}
+        ${canMarkAvailable ? `<button class="user-actions-menu-item success" onclick="handleAssetTableAction('available', ${asset.asset_id})" type="button" role="menuitem">Mark Available</button>` : ''}
+        ${canManage ? `<button class="user-actions-menu-item danger" onclick="handleAssetTableAction('retire', ${asset.asset_id})" type="button" role="menuitem">Retire Asset</button>` : ''}
+        <button class="user-actions-menu-item" onclick="handleAssetTableAction('history', ${asset.asset_id})" type="button" role="menuitem">View History</button>
+    `;
+    document.body.appendChild(menu);
+    positionUserActionsMenu(menu, anchor);
+}
+
+function handleAssetTableAction(action, assetId) {
+    const asset = assetActionsContext.assetsById.get(Number(assetId));
+    closeAssetActionsMenu();
+    if (!asset && action !== 'view' && action !== 'history') return;
+
+    if (action === 'view') {
+        openAssetDetails(assetId);
+        return;
+    }
+    if (action === 'edit') {
+        openEditAsset(assetId);
+        return;
+    }
+    if (action === 'assign') {
+        openAssignAsset(assetId);
+        return;
+    }
+    if (action === 'available') {
+        markAssetAvailable(assetId);
+        return;
+    }
+    if (action === 'retire') {
+        deleteAsset(assetId);
+        return;
+    }
+    if (action === 'history') {
+        pendingAssetDetailTab = 'asset-tab-history';
+        openAssetDetails(assetId);
+    }
+}
+
+function openAssignAsset(assetId) {
+    if (!canManageAssets()) return showToast('Insufficient permissions.', 'error');
+    pendingAssetAssignFocus = true;
+    openEditAsset(assetId);
+}
+
+document.addEventListener('click', event => {
+    const menu = document.getElementById('asset-actions-menu');
+    if (!menu) return;
+    if (menu.contains(event.target) || event.target.closest?.('.asset-actions-trigger')) return;
+    closeAssetActionsMenu();
+});
+window.addEventListener('resize', closeAssetActionsMenu);
+window.addEventListener('scroll', closeAssetActionsMenu, true);
+
+window.toggleAssetActionsMenu = toggleAssetActionsMenu;
+
 function renderReturnedAssetTable(assets) {
+    rememberAssetActions(assets);
     return `
         <table>
             <thead>
@@ -3687,7 +4459,7 @@ function renderReturnedAssetTable(assets) {
                     <th>Status</th>
                     <th>Returned</th>
                     <th>Related Ticket</th>
-                    <th>Actions</th>
+                    <th class="table-actions-col">Actions</th>
                 </tr>
             </thead>
             <tbody>
@@ -3703,7 +4475,7 @@ function renderReturnedAssetTable(assets) {
                         <td>
                             ${a.related_ticket_id ? `<span class="ticket-link" onclick="openTicket(${a.related_ticket_id})">${escHtml(a.related_ticket_number || 'View Ticket')}</span>` : '<span style="color:var(--text-muted);">-</span>'}
                         </td>
-                        <td><button class="btn btn-secondary btn-sm" onclick="openAssetDetails(${a.asset_id})">View</button></td>
+                        <td class="table-actions-cell">${renderAssetActionsTrigger(a)}</td>
                     </tr>
                 `).join('')}
             </tbody>
@@ -3851,6 +4623,16 @@ function renderAssetForm(asset, meta, isEdit) {
     `;
     document.getElementById('asset-form').addEventListener('submit', e => submitAssetForm(e, asset.asset_id));
     syncAssetAssignmentFields();
+    if (pendingAssetAssignFocus) {
+        pendingAssetAssignFocus = false;
+        const statusEl = document.getElementById('asset-form-status');
+        const assignedEl = document.getElementById('asset-assigned-to');
+        if (statusEl && !assetStatusAllowsAssignment(statusEl.value)) {
+            statusEl.value = 'Assigned';
+            syncAssetAssignmentFields();
+        }
+        assignedEl?.focus();
+    }
 }
 
 function assetStatusAllowsAssignment(status) {
@@ -3990,11 +4772,13 @@ async function submitAssetForm(e, assetId = null) {
 }
 
 function openAssetDetails(assetId) {
+    closeAssetActionsMenu();
     currentAssetId = assetId;
     navigateTo('asset-details');
 }
 
 function openEditAsset(assetId) {
+    closeAssetActionsMenu();
     currentAssetId = assetId;
     navigateTo('edit-asset');
 }
@@ -4119,6 +4903,11 @@ async function assetDetailsPage(assetId) {
             </div>
         </div>
     `;
+    if (pendingAssetDetailTab) {
+        const tab = pendingAssetDetailTab;
+        pendingAssetDetailTab = null;
+        requestAnimationFrame(() => switchAssetDetailTab(tab));
+    }
 }
 
 function getReturnedAssetContext(asset, assignments, tickets) {

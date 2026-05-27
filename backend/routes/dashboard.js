@@ -45,6 +45,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
             ticketsByStatus,
             ticketsByPriority,
             ticketsPerMonth,
+            ticketsPerYear,
             assetSummary,
             assetsByStatus,
             assetsByCategory,
@@ -122,6 +123,15 @@ router.get('/stats', authenticateToken, async (req, res) => {
                 WHERE created_at >= DATEADD(MONTH, -11, DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1))
                 GROUP BY YEAR(created_at), MONTH(created_at), DATENAME(MONTH, created_at)
                 ORDER BY YEAR(created_at), MONTH(created_at)
+            `),
+            query(`
+                SELECT
+                    YEAR(created_at) AS year,
+                    COUNT(*) AS count
+                FROM Tickets
+                WHERE created_at >= DATEFROMPARTS(YEAR(GETDATE()) - 4, 1, 1)
+                GROUP BY YEAR(created_at)
+                ORDER BY YEAR(created_at)
             `),
             optionalQuery(`
                 SELECT
@@ -231,6 +241,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
             ticketsByStatus: ticketsByStatus.recordset || [],
             ticketsByPriority: ticketsByPriority.recordset || [],
             ticketsPerMonth: mapMonthlyRows(ticketsPerMonth.recordset),
+            ticketsPerYear: ticketsPerYear.recordset || [],
             assets: {
                 total: assets.total || 0,
                 available: assets.available || 0,

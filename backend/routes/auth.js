@@ -7,7 +7,7 @@ const { query, sql } = require('../config/database');
 const { authenticateToken, ensureUserThemeColumn } = require('../middleware/auth');
 const { logActivity } = require('../utils/activityLogger');
 
-const THEME_PREFERENCES = ['modern', 'classic', 'luna'];
+const THEME_PREFERENCES = ['modern'];
 const PROFILE_STATUSES = ['Active', 'Busy', 'On Break', 'Away', 'On Leave', 'Offline'];
 
 // POST /api/auth/login
@@ -136,8 +136,9 @@ router.patch('/status', authenticateToken, async (req, res) => {
 // PATCH /api/auth/theme
 router.patch('/theme', authenticateToken, async (req, res) => {
     try {
-        const { theme_preference, night_mode_enabled } = req.body;
-        if (!THEME_PREFERENCES.includes(theme_preference)) {
+        const { night_mode_enabled } = req.body;
+        const themePreference = THEME_PREFERENCES.includes(req.body.theme_preference) ? req.body.theme_preference : 'modern';
+        if (!THEME_PREFERENCES.includes(themePreference)) {
             return res.status(400).json({ success: false, message: 'Invalid theme selected.' });
         }
 
@@ -150,7 +151,7 @@ router.patch('/theme', authenticateToken, async (req, res) => {
                 updated_at = GETDATE()
             WHERE user_id = @id
         `, {
-            theme: { type: sql.NVarChar, value: theme_preference },
+            theme: { type: sql.NVarChar, value: themePreference },
             nightMode: { type: sql.Bit, value: nightModeEnabled },
             id: { type: sql.Int, value: req.user.user_id }
         });
@@ -158,7 +159,7 @@ router.patch('/theme', authenticateToken, async (req, res) => {
         res.json({
             success: true,
             message: 'Theme updated.',
-            theme_preference,
+            theme_preference: themePreference,
             night_mode_enabled: !!nightModeEnabled
         });
     } catch (err) {
