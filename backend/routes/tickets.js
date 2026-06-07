@@ -97,6 +97,32 @@ function nullableInt(value) {
     return value === undefined || value === null || value === '' ? null : Number(value);
 }
 
+async function validateSubCategoryForCategory(subCategoryId, categoryId) {
+    const normalizedSubCategoryId = nullableInt(subCategoryId);
+    if (normalizedSubCategoryId === null) return null;
+    if (!Number.isInteger(normalizedSubCategoryId)) {
+        throw new Error('Invalid sub category selected.');
+    }
+    const normalizedCategoryId = nullableInt(categoryId);
+    if (normalizedCategoryId === null || !Number.isInteger(normalizedCategoryId)) {
+        throw new Error('Select a category before selecting a sub category.');
+    }
+
+    const result = await query(`
+        SELECT id
+        FROM SubCategories
+        WHERE id = @subCategoryId
+          AND category_id = @categoryId
+    `, {
+        subCategoryId: { type: sql.Int, value: normalizedSubCategoryId },
+        categoryId: { type: sql.Int, value: normalizedCategoryId }
+    });
+    if (!result.recordset.length) {
+        throw new Error('Selected sub category does not belong to the selected category.');
+    }
+    return normalizedSubCategoryId;
+}
+
 function parsePositiveInt(value, fallback, max = null) {
     const parsed = Number.parseInt(value, 10);
     if (!Number.isInteger(parsed) || parsed < 1) return fallback;
@@ -389,6 +415,7 @@ router.get('/', authenticateToken, async (req, res) => {
                         ELSE 'On Time'
                     END AS sla_status,
                     c.category_name,
+                    sc.name AS sub_category_name,
                     creator.full_name AS created_by_name,
                     assignee.full_name AS assigned_to_name,
                     assignee.user_id AS assigned_to_id,
@@ -398,6 +425,7 @@ router.get('/', authenticateToken, async (req, res) => {
                     (SELECT COUNT(*) FROM TicketComments tc WHERE tc.ticket_id = t.ticket_id) AS comment_count
                 FROM Tickets t
                 LEFT JOIN Categories c ON t.category_id = c.category_id
+                LEFT JOIN SubCategories sc ON t.sub_category_id = sc.id
                 LEFT JOIN Users creator ON t.created_by = creator.user_id
                 LEFT JOIN Users assignee ON t.assigned_to = assignee.user_id
                 ${where}
@@ -664,7 +692,7 @@ router.post('/password-reset-request', async (req, res) => {
 router.get('/:id', authenticateToken, async (req, res) => {
     try {
         const result = await query(`
-            SELECT t.*, c.category_name,
+            SELECT t.*, c.category_name, sc.name AS sub_category_name,
                 CASE WHEN t.acknowledged_at IS NOT NULL THEN DATEDIFF(MINUTE, t.created_at, t.acknowledged_at) END AS time_to_acknowledge_minutes,
                 CASE WHEN t.resolved_at IS NOT NULL THEN DATEDIFF(MINUTE, t.created_at, t.resolved_at) END AS time_to_resolve_minutes,
                 CASE
@@ -685,6 +713,7 @@ router.get('/:id', authenticateToken, async (req, res) => {
                 assignee.user_id AS assigned_to_id, assignee.profile_status AS assigned_to_status
             FROM Tickets t
             LEFT JOIN Categories c ON t.category_id = c.category_id
+            LEFT JOIN SubCategories sc ON t.sub_category_id = sc.id
             LEFT JOIN Users creator ON t.created_by = creator.user_id
             LEFT JOIN Users assignee ON t.assigned_to = assignee.user_id
             WHERE t.ticket_id = @id
@@ -763,21 +792,23 @@ router.get('/:id', authenticateToken, async (req, res) => {
 // POST /api/tickets — create ticket
 router.post('/', authenticateToken, upload.array('attachments', 5), async (req, res) => {
     try {
-        const { title, description, category_id, priority, department, due_date, asset_id } = req.body;
+        const { title, description, category_id, sub_category_id, priority, department, due_date, asset_id } = req.body;
         if (!title || !description) return res.status(400).json({ success: false, message: 'Title and description required.' });
         if (priority && !TICKET_PRIORITIES.includes(priority)) {
             return res.status(400).json({ success: false, message: 'Invalid ticket priority.' });
         }
+        const validSubCategoryId = await validateSubCategoryForCategory(sub_category_id, category_id);
 
         const { ticketNumber, result } = await createTicketWithGeneratedNumber(ticketNumber => query(`
-                INSERT INTO Tickets (ticket_number, title, description, category_id, priority, department, due_date, created_by, status)
+                INSERT INTO Tickets (ticket_number, title, description, category_id, sub_category_id, priority, department, due_date, created_by, status)
                 OUTPUT INSERTED.ticket_id
-                VALUES (@num, @title, @desc, @cat, @priority, @dept, @due, @createdBy, 'Open')
+                VALUES (@num, @title, @desc, @cat, @subCat, @priority, @dept, @due, @createdBy, 'Open')
             `, {
                 num: { type: sql.NVarChar, value: ticketNumber },
                 title: { type: sql.NVarChar, value: title },
                 desc: { type: sql.NVarChar, value: description },
                 cat: { type: sql.Int, value: category_id || null },
+                subCat: { type: sql.Int, value: validSubCategoryId },
                 priority: { type: sql.NVarChar, value: priority || 'Normal' },
                 dept: { type: sql.NVarChar, value: department || req.user.department },
                 due: { type: sql.DateTime, value: due_date || null },
@@ -833,6 +864,9 @@ router.post('/', authenticateToken, upload.array('attachments', 5), async (req, 
         res.json({ success: true, message: 'Ticket created.', ticket_id: ticketId, ticket_number: ticketNumber });
     } catch (err) {
         if (err.message?.toLowerCase().includes('asset')) {
+            return res.status(400).json({ success: false, message: err.message });
+        }
+        if (err.message?.toLowerCase().includes('sub category')) {
             return res.status(400).json({ success: false, message: err.message });
         }
         console.error(err);
@@ -966,7 +1000,7 @@ router.post('/:id/transfer', authenticateToken, async (req, res) => {
 
 router.patch('/:id', authenticateToken, async (req, res) => {
     try {
-        const { status, assigned_to, resolution_notes, priority, due_date, asset_id } = req.body;
+        const { status, assigned_to, resolution_notes, priority, due_date, asset_id, category_id, sub_category_id } = req.body;
         const ticketId = req.params.id;
 
         if (status && !TICKET_STATUSES.includes(status)) {
@@ -1061,6 +1095,23 @@ router.patch('/:id', authenticateToken, async (req, res) => {
         if (resolution_notes) { updates.push('resolution_notes = @notes'); inputs.notes = { type: sql.NVarChar, value: resolution_notes }; }
         if (priority) { updates.push('priority = @priority'); inputs.priority = { type: sql.NVarChar, value: priority }; }
         if (due_date) { updates.push('due_date = @due'); inputs.due = { type: sql.DateTime, value: due_date }; }
+        if (category_id !== undefined) {
+            const categoryId = nullableInt(category_id);
+            if (categoryId !== null && !Number.isInteger(categoryId)) {
+                return res.status(400).json({ success: false, message: 'Invalid category.' });
+            }
+            updates.push('category_id = @categoryId');
+            inputs.categoryId = { type: sql.Int, value: categoryId };
+            if (sub_category_id === undefined && String(categoryId || '') !== String(ticket.category_id || '')) {
+                updates.push('sub_category_id = NULL');
+            }
+        }
+        if (sub_category_id !== undefined) {
+            const effectiveCategoryId = category_id !== undefined ? category_id : ticket.category_id;
+            const validSubCategoryId = await validateSubCategoryForCategory(sub_category_id, effectiveCategoryId);
+            updates.push('sub_category_id = @subCategoryId');
+            inputs.subCategoryId = { type: sql.Int, value: validSubCategoryId };
+        }
         if (asset_id !== undefined) {
             await linkTicketAsset(ticketId, asset_id ? Number(asset_id) : null, req.user);
         }
@@ -1081,6 +1132,9 @@ router.patch('/:id', authenticateToken, async (req, res) => {
         res.json({ success: true, message: 'Ticket updated.' });
     } catch (err) {
         if (err.message?.toLowerCase().includes('asset')) {
+            return res.status(400).json({ success: false, message: err.message });
+        }
+        if (err.message?.toLowerCase().includes('sub category')) {
             return res.status(400).json({ success: false, message: err.message });
         }
         console.error(err);

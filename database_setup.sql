@@ -91,6 +91,26 @@ END
 GO
 
 -- ============================================
+-- SUB CATEGORIES TABLE
+-- ============================================
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'SubCategories')
+BEGIN
+    CREATE TABLE SubCategories (
+        id INT PRIMARY KEY IDENTITY(1,1),
+        category_id INT NOT NULL,
+        name NVARCHAR(100) NOT NULL,
+        description NVARCHAR(255),
+        is_active BIT DEFAULT 1,
+        created_at DATETIME DEFAULT GETDATE(),
+        updated_at DATETIME DEFAULT GETDATE(),
+        FOREIGN KEY (category_id) REFERENCES Categories(category_id)
+    );
+
+    CREATE INDEX IX_SubCategories_category_active ON SubCategories(category_id, is_active, name);
+END
+GO
+
+-- ============================================
 -- TICKETS TABLE
 -- ============================================
 IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'Tickets')
@@ -101,6 +121,7 @@ BEGIN
         title NVARCHAR(255) NOT NULL,
         description NVARCHAR(MAX) NOT NULL,
         category_id INT,
+        sub_category_id INT,
         priority NVARCHAR(20) DEFAULT 'Normal' CHECK (priority IN ('Urgent', 'High', 'Normal', 'Low')),
         status NVARCHAR(20) DEFAULT 'Open' CHECK (status IN ('Open', 'In Progress', 'Pending', 'Resolved', 'Closed')),
         created_by INT NOT NULL,
@@ -113,9 +134,17 @@ BEGIN
         resolved_at DATETIME,
         due_date DATETIME,
         FOREIGN KEY (category_id) REFERENCES Categories(category_id),
+        FOREIGN KEY (sub_category_id) REFERENCES SubCategories(id),
         FOREIGN KEY (created_by) REFERENCES Users(user_id),
         FOREIGN KEY (assigned_to) REFERENCES Users(user_id)
     );
+END
+GO
+
+IF NOT EXISTS (SELECT * FROM sys.columns WHERE object_id = OBJECT_ID('Tickets') AND name = 'sub_category_id')
+BEGIN
+    ALTER TABLE Tickets ADD sub_category_id INT NULL;
+    ALTER TABLE Tickets ADD CONSTRAINT FK_Tickets_SubCategories FOREIGN KEY (sub_category_id) REFERENCES SubCategories(id);
 END
 GO
 
@@ -243,10 +272,12 @@ SELECT
     assignee.email AS assigned_to_email,
     t.department,
     t.due_date,
+    sc.name AS sub_category_name,
     (SELECT COUNT(*) FROM TicketAttachments ta WHERE ta.ticket_id = t.ticket_id) AS attachment_count,
     (SELECT COUNT(*) FROM TicketComments tc WHERE tc.ticket_id = t.ticket_id) AS comment_count
 FROM Tickets t
 LEFT JOIN Categories c ON t.category_id = c.category_id
+LEFT JOIN SubCategories sc ON t.sub_category_id = sc.id
 LEFT JOIN Users creator ON t.created_by = creator.user_id
 LEFT JOIN Users assignee ON t.assigned_to = assignee.user_id;
 GO

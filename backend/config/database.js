@@ -34,6 +34,32 @@ async function ensureSlaColumns(db) {
         END
     `);
 
+    await db.request().query(`
+        IF OBJECT_ID('dbo.SubCategories', 'U') IS NULL
+        BEGIN
+            CREATE TABLE SubCategories (
+                id INT PRIMARY KEY IDENTITY(1,1),
+                category_id INT NOT NULL,
+                name NVARCHAR(100) NOT NULL,
+                description NVARCHAR(255) NULL,
+                is_active BIT NOT NULL DEFAULT 1,
+                created_at DATETIME NOT NULL DEFAULT GETDATE(),
+                updated_at DATETIME NOT NULL DEFAULT GETDATE(),
+                CONSTRAINT FK_SubCategories_Categories FOREIGN KEY (category_id) REFERENCES Categories(category_id)
+            );
+            CREATE INDEX IX_SubCategories_category_active ON SubCategories(category_id, is_active, name);
+        END
+    `);
+
+    await db.request().query(`
+        IF OBJECT_ID('dbo.Tickets', 'U') IS NOT NULL
+            AND COL_LENGTH('dbo.Tickets', 'sub_category_id') IS NULL
+        BEGIN
+            ALTER TABLE Tickets ADD sub_category_id INT NULL;
+            ALTER TABLE Tickets ADD CONSTRAINT FK_Tickets_SubCategories FOREIGN KEY (sub_category_id) REFERENCES SubCategories(id);
+        END
+    `);
+
     schemaReady = true;
 }
 

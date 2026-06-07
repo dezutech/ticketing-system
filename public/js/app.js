@@ -41,6 +41,7 @@ let idleTrackingBound = false;
 let lastIdleActivityHandledAt = 0;
 let autoAwayStatusSet = false;
 let usersActionContext = { usersById: new Map(), roles: [], depts: [] };
+let currentTicketSubCategories = [];
 
 // ─── INIT ───
 document.addEventListener('DOMContentLoaded', async () => {
@@ -2320,7 +2321,7 @@ function renderTicketTable(tickets) {
                         <td><span class="ticket-link">${escHtml(t.title)}</span>
                             ${t.attachment_count > 0 ? `<span style="color:var(--text-muted);font-size:11px;margin-left:6px;">📎${t.attachment_count}</span>` : ''}
                         </td>
-                        <td>${t.category_name || '—'}</td>
+                        <td>${ticketCategoryDisplay(t)}</td>
                         <td>${priorityBadge(t.priority)}</td>
                         <td>${statusBadge(t.status)}</td>
                         <td>${slaStatusBadge(t.sla_status)}</td>
@@ -2331,6 +2332,12 @@ function renderTicketTable(tickets) {
             </tbody>
         </table>
     `;
+}
+
+function ticketCategoryDisplay(ticket) {
+    const category = ticket.category_name ? escHtml(ticket.category_name) : '—';
+    if (!ticket.sub_category_name) return category;
+    return `${category}<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escHtml(ticket.sub_category_name)}</div>`;
 }
 
 function renderPagination(page, totalPages, total) {
@@ -2817,7 +2824,7 @@ async function openTicket(ticketId) {
                                 </div>
                                 <div class="ticket-meta-item">
                                     <span class="ticket-meta-label">Category</span>
-                                    <span class="ticket-meta-value">${t.category_name || '—'}</span>
+                                    <span class="ticket-meta-value">${ticketCategoryDisplay(t)}</span>
                                 </div>
                                 <div class="ticket-meta-item">
                                     <span class="ticket-meta-label">Submitted By</span>
@@ -3022,12 +3029,14 @@ function switchTab(group, activeId) {
 // ─── CREATE TICKET ───
 async function createTicketPage() {
     try {
-    const [catData, deptData, assetData] = await Promise.all([
+    const [catData, subCatData, deptData, assetData] = await Promise.all([
         safeJson('/users/categories', { categories: [] }),
+        safeJson('/users/sub-categories', { sub_categories: [] }),
         safeJson('/users/departments', { departments: [] }),
         assetRequest('GET', '/')
     ]);
     const cats = (catData.categories || []).filter(c => c.is_active);
+    currentTicketSubCategories = (subCatData.sub_categories || []).filter(sc => sc.is_active);
     const depts = (deptData.departments || []).filter(d => d.is_active);
     const assets = assetData.assets || [];
 
@@ -3072,6 +3081,14 @@ async function createTicketPage() {
                                     ${cats.map(c => `<option value="${c.category_id}">${escHtml(c.category_name)}</option>`).join('')}
                                 </select>
                             </div>
+                            <div class="form-group hidden" id="ct-sub-category-group">
+                                <label class="form-label">Sub Category</label>
+                                <select class="form-select" id="ct-sub-category">
+                                    <option value="">Select sub category...</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-row">
                             <div class="form-group">
                                 <label class="form-label">Priority <span class="required">*</span></label>
                                 <select class="form-select" id="ct-priority">
@@ -3127,6 +3144,7 @@ async function createTicketPage() {
     `;
 
     selectedFiles = [];
+    document.getElementById('ct-category')?.addEventListener('change', updateCreateSubCategoryOptions);
     document.getElementById('create-ticket-form').addEventListener('submit', submitCreateTicket);
     } catch (err) {
         console.error('Create ticket page error:', err);
@@ -3139,6 +3157,19 @@ async function createTicketPage() {
 }
 
 let selectedFiles = [];
+
+function updateCreateSubCategoryOptions() {
+    const categoryId = document.getElementById('ct-category')?.value || '';
+    const group = document.getElementById('ct-sub-category-group');
+    const select = document.getElementById('ct-sub-category');
+    if (!group || !select) return;
+
+    const matching = currentTicketSubCategories.filter(sc => String(sc.category_id) === String(categoryId));
+    select.innerHTML = `<option value="">Select sub category...</option>` +
+        matching.map(sc => `<option value="${sc.id}">${escHtml(sc.name)}</option>`).join('');
+    select.value = '';
+    group.classList.toggle('hidden', !categoryId || matching.length === 0);
+}
 
 function handleFileSelect(e) {
     const newFiles = Array.from(e.target.files);
@@ -3193,6 +3224,7 @@ async function submitCreateTicket(e) {
     fd.append('title', title);
     fd.append('description', desc);
     fd.append('category_id', document.getElementById('ct-category').value);
+    fd.append('sub_category_id', document.getElementById('ct-sub-category')?.value || '');
     fd.append('priority', document.getElementById('ct-priority').value);
     fd.append('department', document.getElementById('ct-department').value);
     fd.append('due_date', document.getElementById('ct-due').value);
@@ -3207,6 +3239,7 @@ async function submitCreateTicket(e) {
         selectedFiles = [];
         document.getElementById('create-ticket-form').reset();
         document.getElementById('file-list').innerHTML = '';
+        updateCreateSubCategoryOptions();
         setTimeout(() => navigateTo('my-tickets'), 1500);
     } else {
         alertEl.innerHTML = `<div class="alert alert-error">❌ ${data.message}</div>`;
@@ -3478,7 +3511,12 @@ async function usersPage() {
                                     <td><strong>${escHtml(c.category_name)}</strong></td>
                                     <td style="color:var(--text-muted);font-size:13px;">${c.description || '—'}</td>
                                     <td><span class="badge ${c.is_active ? 'badge-resolved' : 'badge-closed'}">${c.is_active ? 'Active' : 'Inactive'}</span></td>
-                                    <td><button class="btn btn-secondary btn-sm" onclick='openCategoryModal(${JSON.stringify(c).replace(/'/g,"&#39;")})'>Edit</button></td>
+                                    <td>
+                                        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                                            <button class="btn btn-secondary btn-sm" onclick='openCategoryModal(${JSON.stringify(c).replace(/'/g,"&#39;")})'>Edit</button>
+                                            <button class="btn btn-secondary btn-sm" onclick='openSubCategoriesModal(${JSON.stringify(c).replace(/'/g,"&#39;")})'>Sub Categories</button>
+                                        </div>
+                                    </td>
                                 </tr>
                             `).join('')}
                             <tr class="user-management-empty-row hidden"><td colspan="4"><div class="table-empty-state">No categories match your search.</div></td></tr>
@@ -3777,6 +3815,135 @@ async function submitCategory(catId) {
 }
 
 // ─── DEPARTMENT MODAL ───
+async function openSubCategoriesModal(category) {
+    const html = `
+        <div class="modal-overlay active" id="sub-categories-modal">
+            <div class="modal modal-lg">
+                <div class="modal-header">
+                    <div>
+                        <span class="ticket-number" style="font-size:12px;">${escHtml(category.category_name)}</span>
+                        <div class="modal-title" style="margin-top:2px;">Sub Categories</div>
+                    </div>
+                    <button class="modal-close" onclick="closeModal('sub-categories-modal')">x</button>
+                </div>
+                <div class="modal-body">
+                    <div style="display:flex;justify-content:flex-end;gap:12px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
+                        <button class="btn btn-primary btn-sm" onclick='openSubCategoryForm(${JSON.stringify(category).replace(/'/g,"&#39;")})'>Add Sub Category</button>
+                    </div>
+                    <div id="sub-categories-alert"></div>
+                    <div id="sub-categories-list"><div class="empty-state" style="padding:24px;"><p>Loading...</p></div></div>
+                </div>
+            </div>
+        </div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    await loadSubCategoriesList(category);
+}
+
+async function loadSubCategoriesList(category) {
+    const list = document.getElementById('sub-categories-list');
+    if (!list) return;
+    const data = await API.get(`/users/categories/${category.category_id}/sub-categories`);
+    const subCategories = data.sub_categories || [];
+    if (!subCategories.length) {
+        list.innerHTML = '<div class="empty-state" style="padding:24px;"><p>No sub categories yet.</p></div>';
+        return;
+    }
+
+    list.innerHTML = `
+        <div class="table-wrapper">
+            <table>
+                <thead><tr><th>Name</th><th>Description</th><th>Status</th><th>Actions</th></tr></thead>
+                <tbody>
+                    ${subCategories.map(sc => `
+                        <tr>
+                            <td><strong>${escHtml(sc.name)}</strong></td>
+                            <td style="color:var(--text-muted);font-size:13px;">${escHtml(sc.description || '-')}</td>
+                            <td><span class="badge ${sc.is_active ? 'badge-resolved' : 'badge-closed'}">${sc.is_active ? 'Active' : 'Inactive'}</span></td>
+                            <td>
+                                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                                    <button class="btn btn-secondary btn-sm" onclick='openSubCategoryForm(${JSON.stringify(category).replace(/'/g,"&#39;")}, ${JSON.stringify(sc).replace(/'/g,"&#39;")})'>Edit</button>
+                                    <button class="btn btn-secondary btn-sm" onclick='toggleSubCategoryActive(${sc.id}, ${sc.is_active ? 'false' : 'true'}, ${JSON.stringify(category).replace(/'/g,"&#39;")})'>${sc.is_active ? 'Deactivate' : 'Activate'}</button>
+                                </div>
+                            </td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>`;
+}
+
+function openSubCategoryForm(category, subCategory) {
+    const isEdit = !!subCategory;
+    const html = `
+        <div class="modal-overlay active" id="sub-category-form-modal">
+            <div class="modal">
+                <div class="modal-header">
+                    <span class="modal-title">${isEdit ? 'Edit Sub Category' : 'New Sub Category'}</span>
+                    <button class="modal-close" onclick="closeModal('sub-category-form-modal')">x</button>
+                </div>
+                <div class="modal-body">
+                    <div id="sub-cat-alert"></div>
+                    <div class="form-group">
+                        <label class="form-label">Category</label>
+                        <input class="form-input" value="${escHtml(category.category_name)}" disabled>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Sub Category Name <span class="required">*</span></label>
+                        <input class="form-input" id="sub-cat-name" value="${escHtml(subCategory?.name || '')}" placeholder="e.g. Laptop">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Description</label>
+                        <textarea class="form-textarea" id="sub-cat-desc" rows="2" placeholder="Brief description...">${escHtml(subCategory?.description || '')}</textarea>
+                    </div>
+                    <label class="toggle-wrap">
+                        <div class="toggle ${subCategory?.is_active !== false ? 'on' : ''}" id="sub-cat-active"></div>
+                        <div><div style="font-size:13px;font-weight:600;">Active</div><div style="font-size:12px;color:var(--text-muted);">Visible when creating tickets</div></div>
+                    </label>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" onclick="closeModal('sub-category-form-modal')">Cancel</button>
+                    <button class="btn btn-primary" onclick='submitSubCategory(${JSON.stringify(category).replace(/'/g,"&#39;")}, ${subCategory?.id || 'null'})'>${isEdit ? 'Save Changes' : 'Create Sub Category'}</button>
+                </div>
+            </div>
+        </div>`;
+    document.body.insertAdjacentHTML('beforeend', html);
+    document.getElementById('sub-cat-active')?.addEventListener('click', e => e.currentTarget.classList.toggle('on'));
+}
+
+async function submitSubCategory(category, subCategoryId) {
+    const body = {
+        category_id: category.category_id,
+        name: document.getElementById('sub-cat-name').value.trim(),
+        description: document.getElementById('sub-cat-desc').value.trim(),
+        is_active: document.getElementById('sub-cat-active').classList.contains('on')
+    };
+    if (!body.name) {
+        document.getElementById('sub-cat-alert').innerHTML = '<div class="alert alert-error">Sub category name required.</div>';
+        return;
+    }
+
+    const data = subCategoryId
+        ? await API.patch(`/users/sub-categories/${subCategoryId}`, body)
+        : await API.post('/users/sub-categories', body);
+    if (data.success) {
+        closeModal('sub-category-form-modal');
+        showToast(subCategoryId ? 'Sub category updated!' : 'Sub category created!', 'success');
+        await loadSubCategoriesList(category);
+    } else {
+        document.getElementById('sub-cat-alert').innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to save sub category.')}</div>`;
+    }
+}
+
+async function toggleSubCategoryActive(subCategoryId, isActive, category) {
+    const data = await API.patch(`/users/sub-categories/${subCategoryId}/active`, { is_active: isActive });
+    if (data.success) {
+        showToast(isActive ? 'Sub category activated!' : 'Sub category deactivated!', 'success');
+        await loadSubCategoriesList(category);
+    } else {
+        document.getElementById('sub-categories-alert').innerHTML = `<div class="alert alert-error">${escHtml(data.message || 'Unable to update sub category.')}</div>`;
+    }
+}
+
 function openDepartmentModal(dept) {
     const isEdit = !!dept;
     const html = `

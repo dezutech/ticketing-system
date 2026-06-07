@@ -275,6 +275,151 @@ router.patch('/categories/:id', authenticateToken, requirePermission('can_manage
     }
 });
 
+// ============ SUB CATEGORIES ============
+
+router.get('/sub-categories', authenticateToken, async (req, res) => {
+    try {
+        const inputs = {};
+        let where = '';
+        if (req.query.category_id !== undefined && req.query.category_id !== '') {
+            const categoryId = Number.parseInt(req.query.category_id, 10);
+            if (!Number.isInteger(categoryId)) {
+                return res.status(400).json({ success: false, message: 'Invalid category.' });
+            }
+            where = 'WHERE sc.category_id = @categoryId';
+            inputs.categoryId = { type: sql.Int, value: categoryId };
+        }
+
+        const result = await query(`
+            SELECT sc.id, sc.category_id, sc.name, sc.description, sc.is_active,
+                   sc.created_at, sc.updated_at, c.category_name
+            FROM SubCategories sc
+            JOIN Categories c ON sc.category_id = c.category_id
+            ${where}
+            ORDER BY sc.is_active DESC, sc.name
+        `, inputs);
+        res.json({ success: true, sub_categories: result.recordset });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+router.get('/categories/:id/sub-categories', authenticateToken, async (req, res) => {
+    try {
+        const categoryId = Number.parseInt(req.params.id, 10);
+        if (!Number.isInteger(categoryId)) {
+            return res.status(400).json({ success: false, message: 'Invalid category.' });
+        }
+
+        const result = await query(`
+            SELECT sc.id, sc.category_id, sc.name, sc.description, sc.is_active,
+                   sc.created_at, sc.updated_at, c.category_name
+            FROM SubCategories sc
+            JOIN Categories c ON sc.category_id = c.category_id
+            WHERE sc.category_id = @categoryId
+            ORDER BY sc.is_active DESC, sc.name
+        `, { categoryId: { type: sql.Int, value: categoryId } });
+        res.json({ success: true, sub_categories: result.recordset });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+router.post('/sub-categories', authenticateToken, requirePermission('can_manage_users'), async (req, res) => {
+    try {
+        const { category_id, name, description, is_active } = req.body;
+        const categoryId = Number.parseInt(category_id, 10);
+        const cleanName = String(name || '').trim();
+        if (!Number.isInteger(categoryId)) return res.status(400).json({ success: false, message: 'Valid category is required.' });
+        if (!cleanName) return res.status(400).json({ success: false, message: 'Sub category name required.' });
+
+        const category = await query(`SELECT category_id FROM Categories WHERE category_id = @id`, {
+            id: { type: sql.Int, value: categoryId }
+        });
+        if (!category.recordset.length) return res.status(404).json({ success: false, message: 'Category not found.' });
+
+        await query(`
+            INSERT INTO SubCategories (category_id, name, description, is_active)
+            VALUES (@categoryId, @name, @desc, @active)
+        `, {
+            categoryId: { type: sql.Int, value: categoryId },
+            name: { type: sql.NVarChar, value: cleanName },
+            desc: { type: sql.NVarChar, value: description || null },
+            active: { type: sql.Bit, value: is_active !== false ? 1 : 0 }
+        });
+        res.json({ success: true, message: 'Sub category created.' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+async function updateSubCategory(req, res) {
+    try {
+        const { category_id, name, description, is_active } = req.body;
+        const updates = [];
+        const inputs = { id: { type: sql.Int, value: req.params.id } };
+
+        if (category_id !== undefined) {
+            const categoryId = Number.parseInt(category_id, 10);
+            if (!Number.isInteger(categoryId)) return res.status(400).json({ success: false, message: 'Invalid category.' });
+            const category = await query(`SELECT category_id FROM Categories WHERE category_id = @categoryId`, {
+                categoryId: { type: sql.Int, value: categoryId }
+            });
+            if (!category.recordset.length) return res.status(404).json({ success: false, message: 'Category not found.' });
+            updates.push('category_id = @categoryId');
+            inputs.categoryId = { type: sql.Int, value: categoryId };
+        }
+        if (name !== undefined) {
+            const cleanName = String(name || '').trim();
+            if (!cleanName) return res.status(400).json({ success: false, message: 'Sub category name required.' });
+            updates.push('name = @name');
+            inputs.name = { type: sql.NVarChar, value: cleanName };
+        }
+        if (description !== undefined) {
+            updates.push('description = @desc');
+            inputs.desc = { type: sql.NVarChar, value: description || null };
+        }
+        if (is_active !== undefined) {
+            updates.push('is_active = @active');
+            inputs.active = { type: sql.Bit, value: is_active ? 1 : 0 };
+        }
+
+        if (!updates.length) return res.status(400).json({ success: false, message: 'No updates.' });
+        updates.push('updated_at = GETDATE()');
+        const result = await query(`UPDATE SubCategories SET ${updates.join(', ')} WHERE id = @id`, inputs);
+        if (!result.rowsAffected?.[0]) return res.status(404).json({ success: false, message: 'Sub category not found.' });
+        res.json({ success: true, message: 'Sub category updated.' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+}
+
+router.patch('/sub-categories/:id', authenticateToken, requirePermission('can_manage_users'), updateSubCategory);
+router.put('/sub-categories/:id', authenticateToken, requirePermission('can_manage_users'), updateSubCategory);
+
+router.patch('/sub-categories/:id/active', authenticateToken, requirePermission('can_manage_users'), async (req, res) => {
+    try {
+        const isActive = req.body.is_active !== false;
+        const result = await query(`
+            UPDATE SubCategories
+            SET is_active = @active, updated_at = GETDATE()
+            WHERE id = @id
+        `, {
+            id: { type: sql.Int, value: req.params.id },
+            active: { type: sql.Bit, value: isActive ? 1 : 0 }
+        });
+        if (!result.rowsAffected?.[0]) return res.status(404).json({ success: false, message: 'Sub category not found.' });
+        res.json({ success: true, message: isActive ? 'Sub category activated.' : 'Sub category deactivated.' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
 // ============ DEPARTMENTS ============
 
 router.get('/departments', authenticateToken, async (req, res) => {
